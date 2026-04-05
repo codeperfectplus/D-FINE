@@ -16,6 +16,7 @@ import numpy as np
 from PIL import Image
 import coremltools as ct
 import time
+import cv2
 from pathlib import Path
 
 
@@ -62,7 +63,7 @@ class DFineCoreMLPredictor:
         self.compute_units = compute_units
 
         print(f"Loading CoreML model from {model_path}…")
-        self.model = self._load_model(compute_units)
+        self.model = self._load_model()
         print("Model loaded. Warming up (3 runs)…")
         dummy = Image.fromarray(
             np.zeros((input_size, input_size, 3), dtype=np.uint8)
@@ -81,11 +82,10 @@ class DFineCoreMLPredictor:
             or "failed to compile ANE model" in msg
         )
 
-    def _load_model(self, compute_units):
-        self.compute_units = compute_units
+    def _load_model(self):
         return ct.models.MLModel(
             self.model_path,
-            compute_units=compute_units,
+            compute_units=self.compute_units,
         )
 
     def _predict_with_fallback(self, pil_img):
@@ -115,12 +115,12 @@ class DFineCoreMLPredictor:
         -------
         list of dicts with keys: box_xyxy, score, class_id, class_name
         """
-        pil_img, (oh, ow) = self._load_image(image_source)
+        processed_image, (oh, ow) = self._load_image(image_source)
         if orig_size:
             oh, ow = orig_size
 
         t0 = time.perf_counter()
-        out = self._predict_with_fallback(pil_img)
+        out = self._predict_with_fallback(processed_image)
         latency_ms = (time.perf_counter() - t0) * 1000
 
         # out["boxes"]  shape: [1, Q, 4]  (cx, cy, w, h) normalized
@@ -180,12 +180,6 @@ class DFineCoreMLPredictor:
 
     # ── Visualization ─────────────────────────────────────────────
     def draw(self, detections, image_source, out_path: str = "result.jpg"):
-        try:
-            import cv2
-        except ImportError:
-            print("pip install opencv-python for visualization")
-            return
-
         if isinstance(image_source, str):
             img = cv2.imread(image_source)
         else:
@@ -207,11 +201,6 @@ class DFineCoreMLPredictor:
         source=0 → webcam; source="file.mp4" → video file.
         Shows live FPS powered by CoreML.
         """
-        try:
-            import cv2
-        except ImportError:
-            print("pip install opencv-python for video inference")
-            return
 
         cap = cv2.VideoCapture(source)
         fps_buf = []

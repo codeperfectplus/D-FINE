@@ -31,8 +31,7 @@ def get_output_paths(video_path: Path, output_dir: Path):
     stem = video_path.stem
     output_video = output_dir / f"{stem}_coreml_output.mp4"
     output_json = output_dir / f"{stem}_coreml_report.json"
-    output_csv = output_dir / f"{stem}_coreml_metrics.csv"
-    return output_video, output_json, output_csv
+    return output_video, output_json
 
 
 def run_video_inference(
@@ -40,7 +39,6 @@ def run_video_inference(
     video_path: Path,
     output_video: Path,
     output_json: Path,
-    output_csv: Path,
     conf_threshold: float,
     input_size: int,
     compute_units,
@@ -68,7 +66,6 @@ def run_video_inference(
         cap.release()
         raise RuntimeError(f"Failed to create output video: {output_video}")
 
-    report_rows = []
     latencies = []
     frame_index = 0
 
@@ -107,25 +104,6 @@ def run_video_inference(
 
         writer.write(frame)
 
-        report_rows.append(
-            {
-                "frame_index": frame_index,
-                "timestamp_s": round(timestamp_s, 3),
-                "latency_ms": round(latency_ms, 3),
-                "inference_fps": round(infer_fps, 3),
-                "num_detections": len(detections),
-                "detections": [
-                    {
-                        "class_id": int(det["class_id"]),
-                        "class_name": det["class_name"],
-                        "score": round(float(det["score"]), 4),
-                        "box_xyxy": [round(float(v), 2) for v in det["box_xyxy"]],
-                    }
-                    for det in detections
-                ],
-            }
-        )
-
         frame_index += 1
 
     cap.release()
@@ -143,37 +121,9 @@ def run_video_inference(
         "average_latency_ms": round(avg_latency, 3),
         "median_latency_ms": round(med_latency, 3),
         "average_inference_fps": round(avg_infer_fps, 3),
-        "per_frame": report_rows,
     }
 
     output_json.write_text(json.dumps(report, indent=2), encoding="utf-8")
-
-    with output_csv.open("w", newline="", encoding="utf-8") as f:
-        writer_csv = csv.writer(f)
-        writer_csv.writerow(
-            [
-                "frame_index",
-                "timestamp_s",
-                "latency_ms",
-                "inference_fps",
-                "num_detections",
-                "detections",
-            ]
-        )
-        for row in report_rows:
-            detected = "; ".join(
-                f"{d['class_name']}:{d['score']:.2f}" for d in row["detections"]
-            )
-            writer_csv.writerow(
-                [
-                    row["frame_index"],
-                    row["timestamp_s"],
-                    row["latency_ms"],
-                    row["inference_fps"],
-                    row["num_detections"],
-                    detected,
-                ]
-            )
 
     return report
 
@@ -189,7 +139,7 @@ def parse_args():
     )
     parser.add_argument(
         "--model",
-        default="dfine_l.mlpackage",
+        default="dfine_x.mlpackage",
         help="Path to CoreML .mlpackage",
     )
     parser.add_argument(
@@ -222,23 +172,20 @@ def main():
     if not model_path.exists():
         raise FileNotFoundError(f"CoreML model not found: {model_path}")
 
-    output_video, output_json, output_csv = get_output_paths(video_path, Path(args.output_dir))
+    output_video, output_json = get_output_paths(video_path, Path(args.output_dir))
 
     report = run_video_inference(
         model_path=model_path,
         video_path=video_path,
         output_video=output_video,
         output_json=output_json,
-        output_csv=output_csv,
         conf_threshold=args.conf_threshold,
         input_size=args.input_size,
         compute_units=ct.ComputeUnit.CPU_AND_GPU,
     )
 
     print("\nInference complete.")
-    print(f"Output video : {output_video}")
     print(f"JSON report  : {output_json}")
-    print(f"CSV metrics  : {output_csv}")
     print(f"Frames       : {report['frames_processed']}")
     print(f"Avg latency  : {report['average_latency_ms']:.2f} ms")
     print(f"Avg infer FPS: {report['average_inference_fps']:.2f}")
