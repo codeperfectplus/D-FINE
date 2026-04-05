@@ -58,19 +58,49 @@ class DFineCoreMLPredictor:
         self.conf_threshold = conf_threshold
         self.input_size = input_size
         self.class_names = class_names or COCO_CLASSES
+        self.model_path = model_path
+        self.compute_units = compute_units
 
         print(f"Loading CoreML model from {model_path}…")
-        self.model = ct.models.MLModel(
-            model_path,
-            compute_units=compute_units,
-        )
+        self.model = self._load_model(compute_units)
         print("Model loaded. Warming up (3 runs)…")
         dummy = Image.fromarray(
             np.zeros((input_size, input_size, 3), dtype=np.uint8)
         )
         for _ in range(3):
-            self.model.predict({"image": dummy})
+            self._predict_with_fallback(dummy)
         print("Ready.")
+
+    @staticmethod
+    def _is_ane_compile_error(exc: Exception) -> bool:
+        msg = str(exc)
+        return (
+            "MILCompilerForANE" in msg
+            or "ANECCompile() FAILED" in msg
+            or "_ANECompiler" in msg
+            or "failed to compile ANE model" in msg
+        )
+
+    def _load_model(self, compute_units):
+        self.compute_units = compute_units
+        return ct.models.MLModel(
+            self.model_path,
+            compute_units=compute_units,
+        )
+
+    def _predict_with_fallback(self, pil_img):
+        try:
+            return self.model.predict({"image": pil_img})
+        except Exception as e:
+            if not self._is_ane_compile_error(e):
+                raise
+
+            # Fallback to CPU+GPU for models that fail ANE compile at runtime.
+            if self.compute_units in (ct.ComputeUnit.ALL, ct.ComputeUnit.CPU_AND_NE):
+                print("ANE compile failed at runtime. Falling back to CPU_AND_GPU…")
+                self.model = self._load_model(ct.ComputeUnit.CPU_AND_GPU)
+                return self.model.predict({"image": pil_img})
+            raise
 
     # ── Core prediction ───────────────────────────────────────────
     def predict(self, image_source, orig_size: tuple = None):
@@ -90,7 +120,7 @@ class DFineCoreMLPredictor:
             oh, ow = orig_size
 
         t0 = time.perf_counter()
-        out = self.model.predict({"image": pil_img})
+        out = self._predict_with_fallback(pil_img)
         latency_ms = (time.perf_counter() - t0) * 1000
 
         # out["boxes"]  shape: [1, Q, 4]  (cx, cy, w, h) normalized

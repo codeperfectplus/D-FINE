@@ -301,7 +301,6 @@ def convert_to_coreml(
     input_size: int = 640,
     output_path: str = "dfine.mlpackage",
     compute_precision: str = "float16",   # "float16" or "float32"
-    compute_units: str = "ALL",            # "ALL" | "CPU_AND_NE" | "CPU_AND_GPU" | "CPU_ONLY"
 ):
     """
     Convert traced D-FINE to CoreML .mlpackage.
@@ -334,7 +333,7 @@ def convert_to_coreml(
             if compute_precision == "float16"
             else ct.precision.FLOAT32
         ),
-        compute_units=getattr(ct.ComputeUnit, compute_units),
+        compute_units=ct.ComputeUnit.CPU_AND_GPU,
     )
 
     # ── Metadata ───────────────────────────────────────────────────
@@ -367,6 +366,16 @@ def convert_to_coreml(
 # ─────────────────────────────────────────────────────────────────
 # 5. Benchmark (Python)
 # ─────────────────────────────────────────────────────────────────
+def _is_ane_compile_error(exc: Exception) -> bool:
+    msg = str(exc)
+    return (
+        "MILCompilerForANE" in msg
+        or "ANECCompile() FAILED" in msg
+        or "_ANECompiler" in msg
+        or "failed to compile ANE model" in msg
+    )
+
+
 def benchmark(mlmodel, input_size: int = 640, n_runs: int = 50):
     import time, statistics
 
@@ -386,6 +395,54 @@ def benchmark(mlmodel, input_size: int = 640, n_runs: int = 50):
     print(f"\nBenchmark ({n_runs} runs, {input_size}²):")
     print(f"  Median latency : {med:.1f} ms  →  ~{1000/med:.1f} FPS")
     print(f"  Min / Max      : {min(latencies):.1f} / {max(latencies):.1f} ms")
+    return {
+        "median_ms": med,
+        "min_ms": min(latencies),
+        "max_ms": max(latencies),
+        "fps": 1000.0 / med,
+    }
+
+
+def benchmark_compute_units(
+    model_path: str,
+    input_size: int,
+    n_runs: int,
+    compute_units_order,
+):
+    print("\n=== Runtime Compute Unit Benchmark ===")
+    print("This benchmarks the saved .mlpackage with different runtime backends.")
+
+    results = []
+    for cu in compute_units_order:
+        print(f"\nTrying runtime compute_units={cu}…")
+        try:
+            runtime_model = ct.models.MLModel(
+                model_path,
+                compute_units=getattr(ct.ComputeUnit, cu),
+            )
+            stats = benchmark(runtime_model, input_size=input_size, n_runs=n_runs)
+            stats["compute_units"] = cu
+            results.append(stats)
+        except Exception as e:
+            if _is_ane_compile_error(e):
+                print(f"  Skipping {cu}: ANE compile failed ({e})")
+                continue
+            raise
+
+    if not results:
+        raise RuntimeError(
+            "All benchmark runtime compute unit choices failed. "
+            "Try --benchmark_compute_units CPU_AND_GPU,CPU_ONLY"
+        )
+
+    best = max(results, key=lambda x: x["fps"])
+    print("\nBest runtime backend:")
+    print(
+        f"  {best['compute_units']} -> {best['median_ms']:.1f} ms median "
+        f"(~{best['fps']:.1f} FPS)"
+    )
+
+    return results, best
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -398,10 +455,6 @@ def parse_args():
     p.add_argument("--size",       type=int, default=640, help="Input resolution (square)")
     p.add_argument("--output",     default="dfine.mlpackage")
     p.add_argument("--precision",  choices=["float16", "float32"], default="float16")
-    p.add_argument("--compute_units",
-                   choices=["ALL", "CPU_AND_NE", "CPU_AND_GPU", "CPU_ONLY"],
-                   default="ALL",
-                   help="CoreML compute units. ALL lets ANE handle eligible ops.")
     p.add_argument(
         "--frontend",
         choices=["auto", "torch_export", "torchscript"],
@@ -412,6 +465,20 @@ def parse_args():
         ),
     )
     p.add_argument("--benchmark",  action="store_true", help="Run latency benchmark after conversion")
+    p.add_argument(
+        "--benchmark_runs",
+        type=int,
+        default=50,
+        help="Number of timed runs for each benchmark backend",
+    )
+    p.add_argument(
+        "--benchmark_compute_units",
+        default="ALL,CPU_AND_GPU,CPU_AND_NE,CPU_ONLY",
+        help=(
+            "Comma-separated runtime compute units to benchmark against the saved model. "
+            "Order matters. Example: CPU_AND_GPU,CPU_ONLY"
+        ),
+    )
     p.add_argument("--device",     default="cpu", help="Device for tracing (cpu recommended)")
     return p.parse_args()
 
@@ -447,7 +514,7 @@ def main():
     print(f"Checkpoint : {args.checkpoint}")
     print(f"Input size : {args.size}×{args.size}")
     print(f"Precision  : {args.precision}")
-    print(f"Compute    : {args.compute_units}")
+    print("Compute    : CPU_AND_GPU (fixed)")
     print(f"Frontend   : {args.frontend}")
 
     model  = load_dfine(args.config, args.checkpoint, device=args.device)
@@ -465,7 +532,6 @@ def main():
             input_size=args.size,
             output_path=args.output,
             compute_precision=args.precision,
-            compute_units=args.compute_units,
         )
     except Exception as e:
         if args.frontend == "auto" and used_frontend == "torch_export":
@@ -479,18 +545,26 @@ def main():
                 input_size=args.size,
                 output_path=args.output,
                 compute_precision=args.precision,
-                compute_units=args.compute_units,
             )
         else:
             raise
 
     if args.benchmark:
-        benchmark(mlmodel, input_size=args.size)
+        cu_list = [x.strip() for x in args.benchmark_compute_units.split(",") if x.strip()]
+        valid = {"ALL", "CPU_AND_NE", "CPU_AND_GPU", "CPU_ONLY"}
+        invalid = [x for x in cu_list if x not in valid]
+        if invalid:
+            raise ValueError(
+                f"Invalid --benchmark_compute_units values: {invalid}. "
+                f"Valid values: {sorted(valid)}"
+            )
 
-    print("\nDone! Next steps:")
-    print("  1. Open the .mlpackage in Xcode → verify input/output shapes")
-    print("  2. Use VNDetectRectanglesRequest or custom VNCoreMLRequest in Swift")
-    print("  3. Check Activity Monitor → Neural Engine usage during inference")
+        benchmark_compute_units(
+            model_path=args.output,
+            input_size=args.size,
+            n_runs=args.benchmark_runs,
+            compute_units_order=cu_list,
+        )
 
 
 if __name__ == "__main__":

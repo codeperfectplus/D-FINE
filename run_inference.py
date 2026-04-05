@@ -5,6 +5,7 @@ import statistics
 from pathlib import Path
 
 import cv2
+import coremltools as ct
 
 from dfine_coreml_infer import DFineCoreMLPredictor
 
@@ -42,11 +43,13 @@ def run_video_inference(
     output_csv: Path,
     conf_threshold: float,
     input_size: int,
+    compute_units,
 ):
     predictor = DFineCoreMLPredictor(
         str(model_path),
         conf_threshold=conf_threshold,
         input_size=input_size,
+        compute_units=compute_units,
     )
 
     cap = cv2.VideoCapture(str(video_path))
@@ -229,6 +232,7 @@ def main():
         output_csv=output_csv,
         conf_threshold=args.conf_threshold,
         input_size=args.input_size,
+        compute_units=ct.ComputeUnit.CPU_AND_GPU,
     )
 
     print("\nInference complete.")

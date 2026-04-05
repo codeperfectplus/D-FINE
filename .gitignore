@@ -5,3 +5,7 @@ wandb/
 *.pth
 *.onnx
 .DS_Store
+outputs/*
+dfine_l.mlpackage/*
+dfine_x.mlpackage/*
+dfine_m.mlpackage/*
