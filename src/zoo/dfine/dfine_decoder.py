@@ -146,14 +146,15 @@ class MSDeformableAttention(nn.Module):
         )
         attention_weights = F.softmax(attention_weights, dim=-1)
 
-        if reference_points.shape[-1] == 2:
+        ref_last_dim = reference_points.size(-1)
+        if ref_last_dim == 2:
             offset_normalizer = torch.tensor(value_spatial_shapes)
             offset_normalizer = offset_normalizer.flip([1]).reshape(1, 1, 1, self.num_levels, 1, 2)
             sampling_locations = (
                 reference_points.reshape(bs, Len_q, 1, self.num_levels, 1, 2)
                 + sampling_offsets / offset_normalizer
             )
-        elif reference_points.shape[-1] == 4:
+        elif ref_last_dim == 4:
             # reference_points [8, 480, None, 1,  4]
             # sampling_offsets [8, 480, 8,    12, 2]
             num_points_scale = self.num_points_scale.to(dtype=query.dtype).unsqueeze(-1)
@@ -289,10 +290,12 @@ class Integral(nn.Module):
         self.reg_max = reg_max
 
     def forward(self, x, project):
-        shape = x.shape
+        orig_shape = x.shape[:-1]
         x = F.softmax(x.reshape(-1, self.reg_max + 1), dim=1)
-        x = F.linear(x, project.to(x.device)).reshape(-1, 4)
-        return x.reshape(list(shape[:-1]) + [-1])
+        # Equivalent to F.linear(x, weight_vector) but more converter-friendly.
+        proj = project.to(x.device).reshape(1, -1)
+        x = (x * proj).sum(dim=1).reshape(-1, 4)
+        return x.reshape(*orig_shape, -1)
 
 
 class LQE(nn.Module):
@@ -363,7 +366,11 @@ class TransformerDecoder(nn.Module):
         return value.permute(0, 2, 3, 1).split(split_shape, dim=-1)
 
     def convert_to_deploy(self):
-        self.project = weighting_function(self.reg_max, self.up, self.reg_scale, deploy=True)
+        project = weighting_function(self.reg_max, self.up, self.reg_scale, deploy=True)
+        if "project" in self._buffers:
+            self._buffers["project"] = project
+        else:
+            self.register_buffer("project", project)
         self.layers = self.layers[: self.eval_idx + 1]
         self.lqe_layers = nn.ModuleList(
             [nn.Identity()] * (self.eval_idx) + [self.lqe_layers[self.eval_idx]]
@@ -762,8 +769,9 @@ class DFINETransformer(nn.Module):
         else:
             anchors = self.anchors
             valid_mask = self.valid_mask
-        if memory.shape[0] > 1:
-            anchors = anchors.repeat(memory.shape[0], 1, 1)
+        batch_size = memory.size(0)
+        if batch_size > 1:
+            anchors = anchors.repeat(batch_size, 1, 1)
 
         # memory = torch.where(valid_mask, memory, 0)
         # TODO fix type error for onnx export
@@ -788,7 +796,7 @@ class DFINETransformer(nn.Module):
         #     raise NotImplementedError('')
 
         if self.learn_query_content:
-            content = self.tgt_embed.weight.unsqueeze(0).tile([memory.shape[0], 1, 1])
+            content = self.tgt_embed.weight.unsqueeze(0).tile([batch_size, 1, 1])
         else:
             content = enc_topk_memory.detach()
 

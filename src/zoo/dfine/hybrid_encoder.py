@@ -421,8 +421,11 @@ class HybridEncoder(nn.Module):
                     self.hidden_dim,
                     self.pe_temperature,
                 )
-                setattr(self, f"pos_embed{idx}", pos_embed)
-                # self.register_buffer(f'pos_embed{idx}', pos_embed)
+                name = f"pos_embed{idx}"
+                if name in self._buffers:
+                    self._buffers[name] = pos_embed
+                else:
+                    self.register_buffer(name, pos_embed)
 
     @staticmethod
     def build_2d_sincos_position_embedding(w, h, embed_dim=256, temperature=10000.0):

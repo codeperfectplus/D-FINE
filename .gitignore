@@ -4,3 +4,4 @@ weight/
 wandb/
 *.pth
 *.onnx
+.DS_Store
