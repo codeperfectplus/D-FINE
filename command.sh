@@ -1,0 +1,1 @@
+python run_inference.py --video /Users/alpha/codespace/experiments/human_detection/input/people-detection.mp4 --model dfine_l.mlpackage --output_dir outputs
