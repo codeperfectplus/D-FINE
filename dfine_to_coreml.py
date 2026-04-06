@@ -16,8 +16,6 @@ Usage:
 """
 
 import argparse
-import sys
-import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -25,8 +23,12 @@ import numpy as np
 import coremltools as ct
 from pathlib import Path
 from typing import Any, Tuple
+from PIL import Image
+
+from transformers import AutoModelForObjectDetection
 
 
+from src.core import YAMLConfig
 # ─────────────────────────────────────────────────────────────────
 # 1. Inference Wrapper
 #    D-FINE's forward() returns a dict with aux losses etc.
@@ -190,15 +192,29 @@ def replace_multihead_attention_for_export(module: nn.Module):
 # ─────────────────────────────────────────────────────────────────
 # 2. Load D-FINE from the official repo
 # ─────────────────────────────────────────────────────────────────
-def load_dfine(config_path: str, checkpoint_path: str, device: str = "cpu"):
+def load_dfine(
+    config_path: str,
+    checkpoint_path: str,
+    device: str = "cpu",
+    input_size: int = 640,
+):
     """
     Loads D-FINE using the official Peterande/D-FINE codebase.
     The D-FINE repo must be on sys.path (run from its root dir, or add it).
     """
     try:
         # Official D-FINE repo structure
-        from src.core import YAMLConfig
+
         cfg = YAMLConfig(config_path, resume=checkpoint_path)
+
+        # Keep eval spatial size aligned with export resolution so positional
+        # embeddings and anchor grids are generated for the requested input size.
+        eval_spatial_size = [int(input_size), int(input_size)]
+        cfg.yaml_cfg["eval_spatial_size"] = eval_spatial_size
+        if "HybridEncoder" in cfg.yaml_cfg:
+            cfg.yaml_cfg["HybridEncoder"]["eval_spatial_size"] = eval_spatial_size
+        if "DFINETransformer" in cfg.yaml_cfg:
+            cfg.yaml_cfg["DFINETransformer"]["eval_spatial_size"] = eval_spatial_size
 
         # Avoid downloading backbone pretrain weights when checkpoint is provided.
         if "HGNetv2" in cfg.yaml_cfg:
@@ -211,9 +227,34 @@ def load_dfine(config_path: str, checkpoint_path: str, device: str = "cpu"):
             state_dict = checkpoint["model"]
 
         model = cfg.model
-        load_msg = model.load_state_dict(state_dict, strict=False)
-        if getattr(load_msg, "missing_keys", None):
-            print(f"Missing keys while loading checkpoint (ignored): {load_msg.missing_keys}")
+
+        # Checkpoints may contain resolution-dependent buffers (for example,
+        # decoder anchors/valid masks). Skip only incompatible tensor shapes so
+        # exporting at different input sizes can still reuse trained weights.
+        model_state = model.state_dict()
+        filtered_state_dict = {}
+        dropped_mismatch = []
+        for key, value in state_dict.items():
+            if key in model_state and model_state[key].shape != value.shape:
+                dropped_mismatch.append((key, tuple(value.shape), tuple(model_state[key].shape)))
+                continue
+            filtered_state_dict[key] = value
+
+        if dropped_mismatch:
+            print("Skipped shape-mismatched checkpoint tensors:")
+            for key, ckpt_shape, model_shape in dropped_mismatch:
+                print(f"  {key}: ckpt{ckpt_shape} != model{model_shape}")
+
+        load_msg = model.load_state_dict(filtered_state_dict, strict=False)
+
+        missing_keys = list(getattr(load_msg, "missing_keys", None) or [])
+        optional_missing = {"encoder.pos_embed2", "decoder.anchors", "decoder.valid_mask"}
+        non_optional_missing = [k for k in missing_keys if k not in optional_missing]
+        if non_optional_missing:
+            print(f"Missing keys while loading checkpoint (ignored): {non_optional_missing}")
+        elif missing_keys:
+            print(f"Missing optional buffers (safe to ignore): {missing_keys}")
+
         if getattr(load_msg, "unexpected_keys", None):
             print(f"Unexpected keys while loading checkpoint (ignored): {load_msg.unexpected_keys}")
 
@@ -226,7 +267,7 @@ def load_dfine(config_path: str, checkpoint_path: str, device: str = "cpu"):
     except ImportError:
         # Fallback: HuggingFace transformers (ustc-community/dfine-*)
         print("Official D-FINE repo not found; trying HuggingFace transformers…")
-        from transformers import AutoModelForObjectDetection
+
         model = AutoModelForObjectDetection.from_pretrained(checkpoint_path)
 
         replace_multihead_attention_for_export(model)
@@ -380,7 +421,7 @@ def benchmark(mlmodel, input_size: int = 640, n_runs: int = 50):
     import time, statistics
 
     dummy = np.random.randint(0, 255, (input_size, input_size, 3), dtype=np.uint8)
-    from PIL import Image
+
     pil_img = Image.fromarray(dummy)
 
     latencies = []
@@ -517,7 +558,12 @@ def main():
     print("Compute    : CPU_AND_GPU (fixed)")
     print(f"Frontend   : {args.frontend}")
 
-    model  = load_dfine(args.config, args.checkpoint, device=args.device)
+    model  = load_dfine(
+        args.config,
+        args.checkpoint,
+        device=args.device,
+        input_size=args.size,
+    )
     torch_model, used_frontend = prepare_frontend_model(
         model,
         input_size=args.size,

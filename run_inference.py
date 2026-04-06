@@ -1,13 +1,17 @@
 import argparse
-import csv
 import json
 import statistics
 from pathlib import Path
+from typing import List, Optional, Tuple
 
 import cv2
 import coremltools as ct
 
 from dfine_coreml_infer import DFineCoreMLPredictor
+
+
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".m4v", ".webm"}
 
 
 def draw_detections(frame, detections):
@@ -26,30 +30,102 @@ def draw_detections(frame, detections):
         )
 
 
-def get_output_paths(video_path: Path, output_dir: Path):
-    output_dir.mkdir(parents=True, exist_ok=True)
-    stem = video_path.stem
-    output_video = output_dir / f"{stem}_coreml_output.mp4"
-    output_json = output_dir / f"{stem}_coreml_report.json"
-    return output_video, output_json
+def get_media_kind(path: Path) -> Optional[str]:
+    suffix = path.suffix.lower()
+    if suffix in IMAGE_EXTENSIONS:
+        return "image"
+    if suffix in VIDEO_EXTENSIONS:
+        return "video"
+    return None
+
+
+def is_relative_to(path: Path, base: Path) -> bool:
+    try:
+        path.relative_to(base)
+        return True
+    except ValueError:
+        return False
+
+
+def collect_media_inputs(input_path: Path, exclude_dir: Optional[Path] = None) -> List[Path]:
+    if input_path.is_file():
+        media_kind = get_media_kind(input_path)
+        if media_kind is None:
+            raise ValueError(f"Unsupported file type: {input_path}")
+        return [input_path]
+
+    exclude_dir_resolved = exclude_dir.resolve() if exclude_dir else None
+    media_files: List[Path] = []
+    for path in input_path.rglob("*"):
+        if not path.is_file():
+            continue
+        if exclude_dir_resolved and is_relative_to(path.resolve(), exclude_dir_resolved):
+            continue
+        if get_media_kind(path):
+            media_files.append(path)
+
+    media_files.sort(key=lambda p: str(p))
+    if not media_files:
+        raise ValueError(f"No supported image/video files found in: {input_path}")
+    return media_files
+
+
+def ensure_unique_output_pair(output_media: Path, output_json: Path) -> Tuple[Path, Path]:
+    if not output_media.exists() and not output_json.exists():
+        return output_media, output_json
+
+    index = 1
+    while True:
+        media_candidate = output_media.with_name(
+            f"{output_media.stem}_{index}{output_media.suffix}"
+        )
+        json_candidate = output_json.with_name(
+            f"{output_json.stem}_{index}{output_json.suffix}"
+        )
+        if not media_candidate.exists() and not json_candidate.exists():
+            return media_candidate, json_candidate
+        index += 1
+
+
+def get_output_paths(
+    input_path: Path,
+    output_dir: Path,
+    input_root: Optional[Path] = None,
+) -> Tuple[Path, Path]:
+    media_kind = get_media_kind(input_path)
+    if media_kind is None:
+        raise ValueError(f"Unsupported file type: {input_path}")
+
+    target_dir = output_dir
+    if input_root and input_root.is_dir():
+        try:
+            rel_parent = input_path.parent.relative_to(input_root)
+        except ValueError:
+            rel_parent = Path()
+        target_dir = output_dir / rel_parent
+
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    stem = input_path.stem
+    if media_kind == "video":
+        output_media = target_dir / f"{stem}_coreml_output.mp4"
+    else:
+        image_suffix = input_path.suffix.lower()
+        if image_suffix not in IMAGE_EXTENSIONS:
+            image_suffix = ".jpg"
+        output_media = target_dir / f"{stem}_coreml_output{image_suffix}"
+    output_json = target_dir / f"{stem}_coreml_report.json"
+
+    return ensure_unique_output_pair(output_media, output_json)
 
 
 def run_video_inference(
+    predictor: DFineCoreMLPredictor,
     model_path: Path,
     video_path: Path,
     output_video: Path,
     output_json: Path,
-    conf_threshold: float,
-    input_size: int,
-    compute_units,
 ):
-    predictor = DFineCoreMLPredictor(
-        str(model_path),
-        conf_threshold=conf_threshold,
-        input_size=input_size,
-        compute_units=compute_units,
-    )
-
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise RuntimeError(f"Failed to open video: {video_path}")
@@ -114,6 +190,8 @@ def run_video_inference(
     avg_infer_fps = (1000.0 / avg_latency) if avg_latency > 0 else 0.0
 
     report = {
+        "input_type": "video",
+        "input_path": str(video_path),
         "video_path": str(video_path),
         "model_path": str(model_path),
         "frames_processed": frame_index,
@@ -128,14 +206,64 @@ def run_video_inference(
     return report
 
 
+def run_image_inference(
+    predictor: DFineCoreMLPredictor,
+    model_path: Path,
+    image_path: Path,
+    output_image: Path,
+    output_json: Path,
+):
+    frame = cv2.imread(str(image_path))
+    if frame is None:
+        raise RuntimeError(f"Failed to open image: {image_path}")
+
+    height, width = frame.shape[:2]
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    detections, latency_ms = predictor.predict(rgb, orig_size=(height, width))
+    infer_fps = 1000.0 / latency_ms if latency_ms > 0 else 0.0
+
+    draw_detections(frame, detections)
+    cv2.putText(
+        frame,
+        f"lat={latency_ms:.1f}ms fps={infer_fps:.1f}",
+        (10, 30),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        (0, 0, 255),
+        2,
+    )
+
+    if not cv2.imwrite(str(output_image), frame):
+        raise RuntimeError(f"Failed to write output image: {output_image}")
+
+    report = {
+        "input_type": "image",
+        "input_path": str(image_path),
+        "image_path": str(image_path),
+        "model_path": str(model_path),
+        "image_width": width,
+        "image_height": height,
+        "detections_count": len(detections),
+        "latency_ms": round(latency_ms, 3),
+        "inference_fps": round(infer_fps, 3),
+    }
+
+    output_json.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    return report
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Run D-FINE CoreML inference on a video and save outputs"
+        description="Run D-FINE CoreML inference on image/video file(s)"
     )
-    parser.add_argument(
+    source_group = parser.add_mutually_exclusive_group(required=True)
+    source_group.add_argument(
+        "--input",
+        help="Path to input image/video file or directory",
+    )
+    source_group.add_argument(
         "--video",
-        required=True,
-        help="Path to input video",
+        help="Deprecated alias for --input (video file path)",
     )
     parser.add_argument(
         "--model",
@@ -164,31 +292,101 @@ def parse_args():
 
 def main():
     args = parse_args()
-    video_path = Path(args.video)
+    input_path = Path(args.input or args.video)
     model_path = Path(args.model)
+    output_dir = Path(args.output_dir)
 
-    if not video_path.exists():
-        raise FileNotFoundError(f"Input video not found: {video_path}")
+    if not input_path.exists():
+        raise FileNotFoundError(f"Input path not found: {input_path}")
     if not model_path.exists():
         raise FileNotFoundError(f"CoreML model not found: {model_path}")
 
-    output_video, output_json = get_output_paths(video_path, Path(args.output_dir))
+    exclude_dir = None
+    if input_path.is_dir() and is_relative_to(output_dir.resolve(), input_path.resolve()):
+        exclude_dir = output_dir.resolve()
 
-    report = run_video_inference(
-        model_path=model_path,
-        video_path=video_path,
-        output_video=output_video,
-        output_json=output_json,
+    input_files = collect_media_inputs(input_path, exclude_dir=exclude_dir)
+    print(f"Found {len(input_files)} supported input file(s).")
+
+    predictor = DFineCoreMLPredictor(
+        str(model_path),
         conf_threshold=args.conf_threshold,
         input_size=args.input_size,
         compute_units=ct.ComputeUnit.CPU_AND_GPU,
     )
 
+    input_root = input_path if input_path.is_dir() else None
+    reports = []
+
+    for index, media_path in enumerate(input_files, start=1):
+        media_kind = get_media_kind(media_path)
+        output_media, output_json = get_output_paths(
+            media_path,
+            output_dir,
+            input_root=input_root,
+        )
+        print(f"[{index}/{len(input_files)}] Processing {media_kind}: {media_path}")
+
+        if media_kind == "video":
+            report = run_video_inference(
+                predictor=predictor,
+                model_path=model_path,
+                video_path=media_path,
+                output_video=output_media,
+                output_json=output_json,
+            )
+        elif media_kind == "image":
+            report = run_image_inference(
+                predictor=predictor,
+                model_path=model_path,
+                image_path=media_path,
+                output_image=output_media,
+                output_json=output_json,
+            )
+        else:
+            continue
+
+        report["output_path"] = str(output_media)
+        report["report_path"] = str(output_json)
+        reports.append(report)
+
+        print(f"Output saved : {output_media}")
+        print(f"JSON report  : {output_json}")
+
+    if not reports:
+        raise RuntimeError("No inputs were processed.")
+
+    if len(reports) > 1:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        batch_report_path = output_dir / "coreml_batch_report.json"
+        batch_report_path.write_text(json.dumps(reports, indent=2), encoding="utf-8")
+        print(f"Batch report : {batch_report_path}")
+
     print("\nInference complete.")
-    print(f"JSON report  : {output_json}")
-    print(f"Frames       : {report['frames_processed']}")
-    print(f"Avg latency  : {report['average_latency_ms']:.2f} ms")
-    print(f"Avg infer FPS: {report['average_inference_fps']:.2f}")
+    print(f"Inputs       : {len(reports)}")
+
+    if len(reports) == 1:
+        report = reports[0]
+        print(f"JSON report  : {report['report_path']}")
+        if report["input_type"] == "video":
+            print(f"Frames       : {report['frames_processed']}")
+            print(f"Avg latency  : {report['average_latency_ms']:.2f} ms")
+            print(f"Avg infer FPS: {report['average_inference_fps']:.2f}")
+        else:
+            print(f"Detections   : {report['detections_count']}")
+            print(f"Latency      : {report['latency_ms']:.2f} ms")
+            print(f"Infer FPS    : {report['inference_fps']:.2f}")
+    else:
+        latency_values = [
+            report["average_latency_ms"]
+            if report["input_type"] == "video"
+            else report["latency_ms"]
+            for report in reports
+        ]
+        avg_latency = statistics.mean(latency_values)
+        avg_fps = (1000.0 / avg_latency) if avg_latency > 0 else 0.0
+        print(f"Avg latency  : {avg_latency:.2f} ms")
+        print(f"Avg infer FPS: {avg_fps:.2f}")
 
 
 if __name__ == "__main__":

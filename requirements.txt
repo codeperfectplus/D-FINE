@@ -2,8 +2,12 @@ torch>=2.0.1
 torchvision>=0.15.2
 faster-coco-eval>=1.6.6
 PyYAML
-tensorboard
-scipy
+tensorboard==2.20.0
+scipy==1.17.1
 calflops
-transformers
+transformers==5.5.0
 loguru
+pillow==12.2.0
+numpy==2.3.5
+opencv-python==4.13.0.92
+coremltools==9.0
