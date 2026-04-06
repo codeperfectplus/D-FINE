@@ -12,6 +12,12 @@ from dfine_coreml_infer import DFineCoreMLPredictor
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".m4v", ".webm"}
+COMPUTE_UNIT_MAP = {
+    "all": ct.ComputeUnit.ALL,
+    "cpu_and_gpu": ct.ComputeUnit.CPU_AND_GPU,
+    "cpu_and_ne": ct.ComputeUnit.CPU_AND_NE,
+    "cpu_only": ct.ComputeUnit.CPU_ONLY,
+}
 
 
 def draw_detections(frame, detections):
@@ -37,6 +43,33 @@ def get_media_kind(path: Path) -> Optional[str]:
     if suffix in VIDEO_EXTENSIONS:
         return "video"
     return None
+
+
+def infer_model_family(model_path: Path) -> str:
+    name = model_path.name.lower()
+    if "yolo" in name:
+        return "yolo"
+    return "dfine"
+
+
+def resolve_compute_units(choice: str, model_path: Path):
+    family = infer_model_family(model_path)
+
+    if family == "yolo" and choice == "cpu_and_gpu":
+        print(
+            "Warning: YOLO CoreML with cpu_and_gpu can abort on this system "
+            "(MPSGraph MLIR failure). Forcing compute units to cpu_and_ne."
+        )
+        return ct.ComputeUnit.CPU_AND_NE, "cpu_and_ne"
+
+    if choice != "auto":
+        return COMPUTE_UNIT_MAP[choice], choice
+
+    if family == "yolo":
+        # YOLO CoreML packages in this repo can crash on GPU backend, while
+        # CPU_AND_NE and ALL are stable and much faster than CPU_ONLY.
+        return ct.ComputeUnit.CPU_AND_NE, "cpu_and_ne"
+    return ct.ComputeUnit.CPU_AND_GPU, "cpu_and_gpu"
 
 
 def is_relative_to(path: Path, base: Path) -> bool:
@@ -287,6 +320,12 @@ def parse_args():
         default=640,
         help="CoreML model input size used at conversion time",
     )
+    parser.add_argument(
+        "--compute_units",
+        choices=["auto", "all", "cpu_and_gpu", "cpu_and_ne", "cpu_only"],
+        default="auto",
+        help="CoreML compute units. 'auto' uses CPU_AND_NE for YOLO models and CPU_AND_GPU otherwise.",
+    )
     return parser.parse_args()
 
 
@@ -308,11 +347,17 @@ def main():
     input_files = collect_media_inputs(input_path, exclude_dir=exclude_dir)
     print(f"Found {len(input_files)} supported input file(s).")
 
+    compute_units, compute_units_name = resolve_compute_units(
+        args.compute_units,
+        model_path,
+    )
+    print(f"Compute units: {compute_units_name}")
+
     predictor = DFineCoreMLPredictor(
         str(model_path),
         conf_threshold=args.conf_threshold,
         input_size=args.input_size,
-        compute_units=ct.ComputeUnit.CPU_AND_GPU,
+        compute_units=compute_units,
     )
 
     input_root = input_path if input_path.is_dir() else None

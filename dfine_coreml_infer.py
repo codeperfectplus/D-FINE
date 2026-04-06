@@ -17,7 +17,7 @@ from PIL import Image
 import coremltools as ct
 import time
 import cv2
-from pathlib import Path
+from typing import List, Tuple
 
 
 COCO_CLASSES = [
@@ -57,18 +57,33 @@ class DFineCoreMLPredictor:
         compute_units=ct.ComputeUnit.ALL,
     ):
         self.conf_threshold = conf_threshold
-        self.input_size = input_size
+        self.requested_input_size = int(input_size)
+        self.input_size = int(input_size)
         self.class_names = class_names or COCO_CLASSES
         self.model_path = model_path
         self.compute_units = compute_units
 
         print(f"Loading CoreML model from {model_path}…")
         self.model = self._load_model()
+        self.input_width, self.input_height = self._resolve_model_input_size(
+            self.requested_input_size
+        )
+        if self.input_width == self.input_height:
+            self.input_size = self.input_width
+        print(f"Using model input size: {self.input_width}x{self.input_height}")
+
         print("Model loaded. Warming up (3 runs)…")
         dummy = Image.fromarray(
-            np.zeros((input_size, input_size, 3), dtype=np.uint8)
+            np.zeros((self.input_height, self.input_width, 3), dtype=np.uint8)
         )
-        for _ in range(3):
+        first_out = self._predict_with_fallback(dummy)
+        self.output_format, self.primary_output_key = self._infer_output_format(first_out)
+        if self.output_format == "dfine":
+            print("Detected output format: D-FINE boxes/scores")
+        else:
+            print(f"Detected output format: YOLO NMS tensor ({self.primary_output_key})")
+
+        for _ in range(2):
             self._predict_with_fallback(dummy)
         print("Ready.")
 
@@ -82,11 +97,68 @@ class DFineCoreMLPredictor:
             or "failed to compile ANE model" in msg
         )
 
-    def _load_model(self):
+    def _load_model(self, compute_units=None):
+        if compute_units is None:
+            compute_units = self.compute_units
         return ct.models.MLModel(
             self.model_path,
-            compute_units=self.compute_units,
+            compute_units=compute_units,
         )
+
+    def _get_allowed_input_sizes(self) -> List[Tuple[int, int]]:
+        spec = self.model.get_spec()
+        for model_input in spec.description.input:
+            if model_input.type.WhichOneof("Type") != "imageType":
+                continue
+
+            image_type = model_input.type.imageType
+            sizes: List[Tuple[int, int]] = []
+
+            enumerated_sizes = getattr(image_type, "enumeratedSizes", None)
+            if enumerated_sizes is not None:
+                for size in getattr(enumerated_sizes, "sizes", []):
+                    width = int(getattr(size, "width", 0))
+                    height = int(getattr(size, "height", 0))
+                    if width > 0 and height > 0:
+                        sizes.append((width, height))
+
+            fixed_width = int(getattr(image_type, "width", 0))
+            fixed_height = int(getattr(image_type, "height", 0))
+            if fixed_width > 0 and fixed_height > 0:
+                sizes.append((fixed_width, fixed_height))
+
+            unique_sizes: List[Tuple[int, int]] = []
+            seen = set()
+            for size in sizes:
+                if size not in seen:
+                    seen.add(size)
+                    unique_sizes.append(size)
+            return unique_sizes
+
+        return []
+
+    def _resolve_model_input_size(self, requested_size: int) -> Tuple[int, int]:
+        allowed_sizes = self._get_allowed_input_sizes()
+        if not allowed_sizes:
+            return requested_size, requested_size
+
+        requested_shape = (requested_size, requested_size)
+        if requested_shape in allowed_sizes:
+            return requested_shape
+
+        chosen_width, chosen_height = min(
+            allowed_sizes,
+            key=lambda wh: abs(wh[0] - requested_size) + abs(wh[1] - requested_size),
+        )
+
+        allowed_text = ", ".join(f"{w}x{h}" for w, h in allowed_sizes)
+        print(
+            "Requested input_size "
+            f"{requested_size}x{requested_size} is not supported by this model. "
+            f"Using {chosen_width}x{chosen_height}. "
+            f"Allowed size(s): {allowed_text}"
+        )
+        return chosen_width, chosen_height
 
     def _predict_with_fallback(self, pil_img):
         try:
@@ -98,9 +170,28 @@ class DFineCoreMLPredictor:
             # Fallback to CPU+GPU for models that fail ANE compile at runtime.
             if self.compute_units in (ct.ComputeUnit.ALL, ct.ComputeUnit.CPU_AND_NE):
                 print("ANE compile failed at runtime. Falling back to CPU_AND_GPU…")
+                self.compute_units = ct.ComputeUnit.CPU_AND_GPU
                 self.model = self._load_model(ct.ComputeUnit.CPU_AND_GPU)
                 return self.model.predict({"image": pil_img})
             raise
+
+    def _infer_output_format(self, out):
+        if not isinstance(out, dict):
+            raise RuntimeError(f"Unexpected CoreML output type: {type(out)}")
+
+        if "boxes" in out and "scores" in out:
+            return "dfine", "boxes"
+
+        for key, value in out.items():
+            arr = np.array(value)
+            if arr.ndim >= 2 and arr.shape[-1] == 6:
+                return "yolo_nms6", key
+
+        keys = ", ".join(out.keys())
+        raise RuntimeError(
+            "Unsupported CoreML output format. "
+            f"Expected keys ('boxes','scores') or a tensor with last dim=6, got: {keys}"
+        )
 
     # ── Core prediction ───────────────────────────────────────────
     def predict(self, image_source, orig_size: tuple = None):
@@ -123,12 +214,18 @@ class DFineCoreMLPredictor:
         out = self._predict_with_fallback(processed_image)
         latency_ms = (time.perf_counter() - t0) * 1000
 
-        # out["boxes"]  shape: [1, Q, 4]  (cx, cy, w, h) normalized
-        # out["scores"] shape: [1, Q, C]
-        boxes  = np.array(out["boxes"])[0]   # [Q, 4]
-        scores = np.array(out["scores"])[0]  # [Q, C]
+        if self.output_format == "dfine":
+            # out["boxes"]  shape: [1, Q, 4]  (cx, cy, w, h) normalized
+            # out["scores"] shape: [1, Q, C]
+            boxes  = np.array(out["boxes"])[0]   # [Q, 4]
+            scores = np.array(out["scores"])[0]  # [Q, C]
+            detections = self._decode(boxes, scores, oh, ow)
+        elif self.output_format == "yolo_nms6":
+            yolo_output = np.array(out[self.primary_output_key])
+            detections = self._decode_yolo_nms6(yolo_output, oh, ow)
+        else:
+            raise RuntimeError(f"Unknown output format: {self.output_format}")
 
-        detections = self._decode(boxes, scores, oh, ow)
         return detections, latency_ms
 
     def _load_image(self, source):
@@ -142,7 +239,7 @@ class DFineCoreMLPredictor:
             raise TypeError(f"Unsupported image type: {type(source)}")
 
         orig_h, orig_w = img.size[1], img.size[0]
-        resized = img.resize((self.input_size, self.input_size), Image.BILINEAR)
+        resized = img.resize((self.input_width, self.input_height), Image.BILINEAR)
         return resized, (orig_h, orig_w)
 
     def _decode(self, boxes, scores, orig_h, orig_w):
@@ -176,6 +273,42 @@ class DFineCoreMLPredictor:
                                if int(cls_id) < len(self.class_names)
                                else str(cls_id),
             })
+        return detections
+
+    def _decode_yolo_nms6(self, predictions, orig_h, orig_w):
+        """Decode YOLO post-NMS output shaped [1, N, 6] or [N, 6]."""
+        if predictions.ndim == 3:
+            predictions = predictions[0]
+        if predictions.ndim != 2 or predictions.shape[-1] != 6:
+            raise RuntimeError(
+                f"Unexpected YOLO output shape: {predictions.shape}; expected [N, 6]"
+            )
+
+        scale_x = orig_w / float(self.input_width)
+        scale_y = orig_h / float(self.input_height)
+
+        detections = []
+        for row in predictions:
+            x1, y1, x2, y2, score, cls_id = [float(v) for v in row]
+            if score < self.conf_threshold:
+                continue
+
+            class_id = int(round(cls_id))
+            detections.append(
+                {
+                    "box_xyxy": [
+                        float(np.clip(x1 * scale_x, 0, orig_w)),
+                        float(np.clip(y1 * scale_y, 0, orig_h)),
+                        float(np.clip(x2 * scale_x, 0, orig_w)),
+                        float(np.clip(y2 * scale_y, 0, orig_h)),
+                    ],
+                    "score": float(score),
+                    "class_id": class_id,
+                    "class_name": self.class_names[class_id]
+                    if class_id < len(self.class_names)
+                    else str(class_id),
+                }
+            )
         return detections
 
     # ── Visualization ─────────────────────────────────────────────
