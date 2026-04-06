@@ -192,7 +192,7 @@ def parse_args():
         default=None,
         help="Directory containing images (default: parent folder of annotations)",
     )
-    parser.add_argument("--conf_threshold", type=float, default=0.4)
+    parser.add_argument("--conf_threshold", type=float, default=0.5)
     parser.add_argument("--iou_threshold", type=float, default=0.5)
     parser.add_argument("--input_size", type=int, default=640)
     parser.add_argument(
@@ -383,7 +383,6 @@ def main():
         "true_positives": total_tp,
         "false_positives": total_fp,
         "false_negatives": total_fn,
-        # Explicitly named summary metrics requested by user.
         "AP50": round(ap50, 6),
         "Precision@IoU0.5": round(precision, 6),
         "Recall@IoU0.5": round(recall, 6),
