@@ -8,3 +8,4 @@ wandb/
 outputs/*
 dfine_*/*
 weights/*
+dataset/*

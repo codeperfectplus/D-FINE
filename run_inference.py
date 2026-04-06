@@ -2,7 +2,7 @@ import argparse
 import json
 import statistics
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, Set, Tuple
 
 import cv2
 import coremltools as ct
@@ -18,6 +18,37 @@ COMPUTE_UNIT_MAP = {
     "cpu_and_ne": ct.ComputeUnit.CPU_AND_NE,
     "cpu_only": ct.ComputeUnit.CPU_ONLY,
 }
+
+
+def parse_class_ids_arg(classes_arg: str) -> Optional[Set[int]]:
+    value = classes_arg.strip()
+    if value.lower() in {"all", "*"}:
+        return None
+
+    value = value.strip("[]")
+    if not value:
+        return None
+
+    class_ids: Set[int] = set()
+    for token in value.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            class_ids.add(int(token))
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid class id '{token}' in --classes. "
+                "Use 'all' or comma-separated integers like '0,1'."
+            ) from exc
+
+    return class_ids or None
+
+
+def filter_detections_by_class(detections, class_ids: Optional[Set[int]]):
+    if class_ids is None:
+        return detections
+    return [det for det in detections if int(det.get("class_id", -1)) in class_ids]
 
 
 def draw_detections(frame, detections):
@@ -158,6 +189,7 @@ def run_video_inference(
     video_path: Path,
     output_video: Path,
     output_json: Path,
+    class_ids: Optional[Set[int]] = None,
 ):
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -187,6 +219,7 @@ def run_video_inference(
         timestamp_s = frame_index / src_fps
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         detections, latency_ms = predictor.predict(rgb, orig_size=(height, width))
+        detections = filter_detections_by_class(detections, class_ids)
         infer_fps = 1000.0 / latency_ms if latency_ms > 0 else 0.0
 
         latencies.append(latency_ms)
@@ -227,6 +260,7 @@ def run_video_inference(
         "input_path": str(video_path),
         "video_path": str(video_path),
         "model_path": str(model_path),
+        "class_filter_ids": sorted(class_ids) if class_ids is not None else "all",
         "frames_processed": frame_index,
         "source_video_fps": round(src_fps, 3),
         "average_latency_ms": round(avg_latency, 3),
@@ -245,6 +279,7 @@ def run_image_inference(
     image_path: Path,
     output_image: Path,
     output_json: Path,
+    class_ids: Optional[Set[int]] = None,
 ):
     frame = cv2.imread(str(image_path))
     if frame is None:
@@ -253,6 +288,7 @@ def run_image_inference(
     height, width = frame.shape[:2]
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     detections, latency_ms = predictor.predict(rgb, orig_size=(height, width))
+    detections = filter_detections_by_class(detections, class_ids)
     infer_fps = 1000.0 / latency_ms if latency_ms > 0 else 0.0
 
     draw_detections(frame, detections)
@@ -274,6 +310,7 @@ def run_image_inference(
         "input_path": str(image_path),
         "image_path": str(image_path),
         "model_path": str(model_path),
+        "class_filter_ids": sorted(class_ids) if class_ids is not None else "all",
         "image_width": width,
         "image_height": height,
         "detections_count": len(detections),
@@ -326,6 +363,11 @@ def parse_args():
         default="auto",
         help="CoreML compute units. 'auto' uses CPU_AND_NE for YOLO models and CPU_AND_GPU otherwise.",
     )
+    parser.add_argument(
+        "--classes",
+        default="all",
+        help="Class IDs to keep. Use 'all' (default), '0', '0,1', or '[0,1]'.",
+    )
     return parser.parse_args()
 
 
@@ -353,6 +395,12 @@ def main():
     )
     print(f"Compute units: {compute_units_name}")
 
+    class_ids = parse_class_ids_arg(args.classes)
+    if class_ids is None:
+        print("Class filter: all")
+    else:
+        print(f"Class filter: {sorted(class_ids)}")
+
     predictor = DFineCoreMLPredictor(
         str(model_path),
         conf_threshold=args.conf_threshold,
@@ -379,6 +427,7 @@ def main():
                 video_path=media_path,
                 output_video=output_media,
                 output_json=output_json,
+                class_ids=class_ids,
             )
         elif media_kind == "image":
             report = run_image_inference(
@@ -387,6 +436,7 @@ def main():
                 image_path=media_path,
                 output_image=output_media,
                 output_json=output_json,
+                class_ids=class_ids,
             )
         else:
             continue

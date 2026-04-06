@@ -85,7 +85,7 @@ def _patch_coremltools_int_and_compute():
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint", default="yolo26x.pt")
+    parser.add_argument("--checkpoint", default="yolo26l.pt")
     parser.add_argument("--output", default=None, help="Defaults to <stem>.mlpackage")
     parser.add_argument("--size", type=int, default=640)
     parser.add_argument(
