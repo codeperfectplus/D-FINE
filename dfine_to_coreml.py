@@ -379,6 +379,9 @@ def convert_to_coreml(
     mlmodel.output_description["scores"] = (
         "Class probabilities [1, Q, C] after sigmoid"
     )
+    mlmodel.author = "CodePerfectplus | Deepak Raj"
+    mlmodel.version = "1.0"
+
 
     mlmodel.save(output_path)
     out_path = Path(output_path)
