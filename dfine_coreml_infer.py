@@ -219,6 +219,15 @@ class DFineCoreMLPredictor:
             if not self._is_ane_compile_error(e):
                 raise
 
+            # Fallback to CPU+GPU for models that fail ANE compile at runtime.
+            if self.compute_units in (ct.ComputeUnit.ALL, ct.ComputeUnit.CPU_AND_NE):
+                print("ANE compile failed at runtime. Falling back to CPU_AND_GPU…")
+                self.compute_units = ct.ComputeUnit.CPU_AND_GPU
+                self.model = self._load_model(ct.ComputeUnit.CPU_AND_GPU)
+                out = self.model.predict({"image": processed_image})
+            else:
+                raise
+
         latency_ms = (time.perf_counter() - t0) * 1000
 
         if return_raw_output:

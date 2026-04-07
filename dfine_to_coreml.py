@@ -195,82 +195,73 @@ def replace_multihead_attention_for_export(module: nn.Module):
 def load_dfine(
     config_path: str,
     checkpoint_path: str,
-    device: str = "cpu",
+    device: str = "mps",
     input_size: int = 640,
 ):
     """
     Loads D-FINE using the official Peterande/D-FINE codebase.
     The D-FINE repo must be on sys.path (run from its root dir, or add it).
     """
-    try:
-        # Official D-FINE repo structure
+    cfg = YAMLConfig(config_path, resume=checkpoint_path)
 
-        cfg = YAMLConfig(config_path, resume=checkpoint_path)
+    # Keep eval spatial size aligned with export resolution so positional
+    # embeddings and anchor grids are generated for the requested input size.
+    eval_spatial_size = [int(input_size), int(input_size)]
+    cfg.yaml_cfg["eval_spatial_size"] = eval_spatial_size
+    if "HybridEncoder" in cfg.yaml_cfg:
+        cfg.yaml_cfg["HybridEncoder"]["eval_spatial_size"] = eval_spatial_size
+    if "DFINETransformer" in cfg.yaml_cfg:
+        cfg.yaml_cfg["DFINETransformer"]["eval_spatial_size"] = eval_spatial_size
 
-        # Keep eval spatial size aligned with export resolution so positional
-        # embeddings and anchor grids are generated for the requested input size.
-        eval_spatial_size = [int(input_size), int(input_size)]
-        cfg.yaml_cfg["eval_spatial_size"] = eval_spatial_size
-        if "HybridEncoder" in cfg.yaml_cfg:
-            cfg.yaml_cfg["HybridEncoder"]["eval_spatial_size"] = eval_spatial_size
-        if "DFINETransformer" in cfg.yaml_cfg:
-            cfg.yaml_cfg["DFINETransformer"]["eval_spatial_size"] = eval_spatial_size
+    # Avoid downloading backbone pretrain weights when checkpoint is provided.
+    if "HGNetv2" in cfg.yaml_cfg:
+        cfg.yaml_cfg["HGNetv2"]["pretrained"] = False
 
-        # Avoid downloading backbone pretrain weights when checkpoint is provided.
-        if "HGNetv2" in cfg.yaml_cfg:
-            cfg.yaml_cfg["HGNetv2"]["pretrained"] = False
+    checkpoint = torch.load(checkpoint_path, map_location="mps")
+    if "ema" in checkpoint:
+        state_dict = checkpoint["ema"]["module"]
+    else:
+        state_dict = checkpoint["model"]
 
-        checkpoint = torch.load(checkpoint_path, map_location="cpu")
-        if "ema" in checkpoint:
-            state_dict = checkpoint["ema"]["module"]
-        else:
-            state_dict = checkpoint["model"]
+    model = cfg.model
 
-        model = cfg.model
+    # Checkpoints may contain resolution-dependent buffers (for example,
+    # decoder anchors/valid masks). Skip only incompatible tensor shapes so
+    # exporting at different input sizes can still reuse trained weights.
+    model_state = model.state_dict()
+    filtered_state_dict = {}
+    dropped_mismatch = []
+    for key, value in state_dict.items():
+        if key in model_state and model_state[key].shape != value.shape:
+            dropped_mismatch.append((key, tuple(value.shape), tuple(model_state[key].shape)))
+            continue
+        filtered_state_dict[key] = value
 
-        # Checkpoints may contain resolution-dependent buffers (for example,
-        # decoder anchors/valid masks). Skip only incompatible tensor shapes so
-        # exporting at different input sizes can still reuse trained weights.
-        model_state = model.state_dict()
-        filtered_state_dict = {}
-        dropped_mismatch = []
-        for key, value in state_dict.items():
-            if key in model_state and model_state[key].shape != value.shape:
-                dropped_mismatch.append((key, tuple(value.shape), tuple(model_state[key].shape)))
-                continue
-            filtered_state_dict[key] = value
+    if dropped_mismatch:
+        print("Skipped shape-mismatched checkpoint tensors:")
+        for key, ckpt_shape, model_shape in dropped_mismatch:
+            print(f"  {key}: ckpt{ckpt_shape} != model{model_shape}")
 
-        if dropped_mismatch:
-            print("Skipped shape-mismatched checkpoint tensors:")
-            for key, ckpt_shape, model_shape in dropped_mismatch:
-                print(f"  {key}: ckpt{ckpt_shape} != model{model_shape}")
+    load_msg = model.load_state_dict(filtered_state_dict, strict=False)
 
-        load_msg = model.load_state_dict(filtered_state_dict, strict=False)
+    missing_keys = list(getattr(load_msg, "missing_keys", None) or [])
+    optional_missing = {"encoder.pos_embed2", "decoder.anchors", "decoder.valid_mask"}
+    non_optional_missing = [k for k in missing_keys if k not in optional_missing]
+    if non_optional_missing:
+        print(f"Missing keys while loading checkpoint (ignored): {non_optional_missing}")
+    elif missing_keys:
+        print(f"Missing optional buffers (safe to ignore): {missing_keys}")
 
-        missing_keys = list(getattr(load_msg, "missing_keys", None) or [])
-        optional_missing = {"encoder.pos_embed2", "decoder.anchors", "decoder.valid_mask"}
-        non_optional_missing = [k for k in missing_keys if k not in optional_missing]
-        if non_optional_missing:
-            print(f"Missing keys while loading checkpoint (ignored): {non_optional_missing}")
-        elif missing_keys:
-            print(f"Missing optional buffers (safe to ignore): {missing_keys}")
+    if getattr(load_msg, "unexpected_keys", None):
+        print(f"Unexpected keys while loading checkpoint (ignored): {load_msg.unexpected_keys}")
 
-        if getattr(load_msg, "unexpected_keys", None):
-            print(f"Unexpected keys while loading checkpoint (ignored): {load_msg.unexpected_keys}")
+    # Convert train-time modules to deploy/inference mode where available.
+    if hasattr(model, "deploy"):
+        model = model.deploy()
 
-        # Convert train-time modules to deploy/inference mode where available.
-        if hasattr(model, "deploy"):
-            model = model.deploy()
-
-        # Replace built-in MHA to avoid known CoreML conversion failures in attention ops.
-        replace_multihead_attention_for_export(model)
-    except ImportError:
-        # Fallback: HuggingFace transformers (ustc-community/dfine-*)
-        print("Official D-FINE repo not found; trying HuggingFace transformers…")
-
-        model = AutoModelForObjectDetection.from_pretrained(checkpoint_path)
-
-        replace_multihead_attention_for_export(model)
+    # Replace built-in MHA to avoid known CoreML conversion failures in attention ops.
+    replace_multihead_attention_for_export(model)
+    
 
     model.eval()
     model = model.to(device)
@@ -286,7 +277,7 @@ def load_dfine(
 def trace_model(
     model: nn.Module,
     input_size: int = 640,
-    device: str = "cpu",
+    device: str = "mps",
 ) -> torch.jit.ScriptModule:
     wrapper = DFineInferenceWrapper(model).to(device)
     wrapper.eval()
@@ -308,7 +299,7 @@ def trace_model(
 def export_model(
     model: nn.Module,
     input_size: int = 640,
-    device: str = "cpu",
+    device: str = "mps",
 ):
     """
     Export model via torch.export (ExportedProgram), which is often
@@ -520,7 +511,7 @@ def parse_args():
             "Order matters. Example: CPU_AND_GPU,CPU_ONLY"
         ),
     )
-    p.add_argument("--device",     default="cpu", help="Device for tracing (cpu recommended)")
+    p.add_argument("--device",     default="mps", help="Device for tracing (cpu recommended)")
     return p.parse_args()
 
 
