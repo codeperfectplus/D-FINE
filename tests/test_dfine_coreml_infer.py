@@ -6,7 +6,7 @@ from PIL import Image
 
 import coremltools as ct
 
-from dfine_coreml_infer import DFineCoreMLPredictor
+from coreml_predictor import DFineCoreMLPredictor
 
 
 def _build_stub_predictor(conf_threshold: float = 0.4):

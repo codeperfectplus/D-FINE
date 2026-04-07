@@ -7,7 +7,7 @@ from typing import List, Optional, Set, Tuple
 import cv2
 import coremltools as ct
 
-from dfine_coreml_infer import DFineCoreMLPredictor
+from coreml_predictor import DFineCoreMLPredictor
 
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}

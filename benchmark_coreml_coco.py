@@ -8,7 +8,7 @@ from typing import Dict, List, Sequence, Set, Tuple
 import cv2
 import coremltools as ct
 
-from dfine_coreml_infer import DFineCoreMLPredictor
+from coreml_predictor import DFineCoreMLPredictor
 
 
 COMPUTE_UNIT_MAP = {
