@@ -76,7 +76,11 @@ class DFineCoreMLPredictor:
         dummy = Image.fromarray(
             np.zeros((self.input_height, self.input_width, 3), dtype=np.uint8)
         )
-        first_out = self._predict_with_fallback(dummy)
+        first_out, _ = self.predict(
+            dummy,
+            orig_size=(self.input_height, self.input_width),
+            return_raw_output=True,
+        )
         self.output_format, self.primary_output_key = self._infer_output_format(first_out)
         if self.output_format == "dfine":
             print("Detected output format: D-FINE boxes/scores")
@@ -84,7 +88,11 @@ class DFineCoreMLPredictor:
             print(f"Detected output format: YOLO NMS tensor ({self.primary_output_key})")
 
         for _ in range(2):
-            self._predict_with_fallback(dummy)
+            self.predict(
+                dummy,
+                orig_size=(self.input_height, self.input_width),
+                return_raw_output=True,
+            )
         print("Ready.")
 
     @staticmethod
@@ -160,21 +168,6 @@ class DFineCoreMLPredictor:
         )
         return chosen_width, chosen_height
 
-    def _predict_with_fallback(self, pil_img):
-        try:
-            return self.model.predict({"image": pil_img})
-        except Exception as e:
-            if not self._is_ane_compile_error(e):
-                raise
-
-            # Fallback to CPU+GPU for models that fail ANE compile at runtime.
-            if self.compute_units in (ct.ComputeUnit.ALL, ct.ComputeUnit.CPU_AND_NE):
-                print("ANE compile failed at runtime. Falling back to CPU_AND_GPU…")
-                self.compute_units = ct.ComputeUnit.CPU_AND_GPU
-                self.model = self._load_model(ct.ComputeUnit.CPU_AND_GPU)
-                return self.model.predict({"image": pil_img})
-            raise
-
     def _infer_output_format(self, out):
         if not isinstance(out, dict):
             raise RuntimeError(f"Unexpected CoreML output type: {type(out)}")
@@ -194,25 +187,42 @@ class DFineCoreMLPredictor:
         )
 
     # ── Core prediction ───────────────────────────────────────────
-    def predict(self, image_source, orig_size: tuple = None):
+    def predict(
+        self,
+        image_source,
+        orig_size: tuple = None,
+        return_raw_output: bool = False,
+    ):
         """
         Parameters
         ----------
         image_source : str path, PIL.Image, or np.ndarray (H,W,3) uint8
         orig_size    : (H, W) of original image for coordinate rescaling.
                        If None, uses input_size.
+        return_raw_output : If True, skip decoding and return raw CoreML output.
 
         Returns
         -------
-        list of dicts with keys: box_xyxy, score, class_id, class_name
+        If return_raw_output=False:
+            (list of dicts, latency_ms)
+        If return_raw_output=True:
+            (raw_output_dict, latency_ms)
         """
         processed_image, (oh, ow) = self._load_image(image_source)
         if orig_size:
             oh, ow = orig_size
 
         t0 = time.perf_counter()
-        out = self._predict_with_fallback(processed_image)
+        try:
+            out = self.model.predict({"image": processed_image})
+        except Exception as e:
+            if not self._is_ane_compile_error(e):
+                raise
+
         latency_ms = (time.perf_counter() - t0) * 1000
+
+        if return_raw_output:
+            return out, latency_ms
 
         if self.output_format == "dfine":
             # out["boxes"]  shape: [1, Q, 4]  (cx, cy, w, h) normalized
