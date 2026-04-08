@@ -3,7 +3,7 @@
 ## 1) Convert PyTorch Model → CoreML
 
 ```bash
-python dfine_to_coreml.py \
+python export_dfine_coreml.py \
   --config configs/dfine/dfine_hgnetv2_x_coco.yml \
   --checkpoint weights/dfine_x_obj2coco.pth \
   --size 640 \
@@ -21,7 +21,7 @@ python dfine_to_coreml.py \
 ### Folder of images
 
 ```bash
-python run_inference.py \
+python infer_coreml.py \
   --input /Users/alpha/Downloads/sample-videos-master/ \
   --model weights/dfine_x.mlpackage \
   --output_dir outputs
@@ -31,19 +31,19 @@ python run_inference.py \
 
 ```bash
 # D-FINE X
-python run_inference.py \
+python infer_coreml.py \
   --video /Users/alpha/codespace/experiments/human_detection/input/people-detection.mp4 \
   --model weights/dfine_x.mlpackage \
   --output_dir outputs
 
 # D-FINE L
-python run_inference.py \
+python infer_coreml.py \
   --video /Users/alpha/codespace/experiments/human_detection/input/people-detection.mp4 \
   --model weights/dfine_l.mlpackage \
   --output_dir outputs
 
 # D-FINE M
-python run_inference.py \
+python infer_coreml.py \
   --video /Users/alpha/codespace/experiments/human_detection/input/people-detection.mp4 \
   --model weights/dfine_m.mlpackage \
   --output_dir outputs
@@ -52,7 +52,7 @@ python run_inference.py \
 ### YOLO CoreML conversion (compare with D-FINE)
 
 ```bash
-python run_inference.py \
+python infer_coreml.py \
   --video /Users/alpha/codespace/experiments/human_detection/input/people-detection.mp4 \
   --model yolo26n.mlpackage \
   --output_dir outputs \
@@ -78,7 +78,7 @@ python benchmark_coreml_coco.py \
 ## 4) Inference for Specific Classes Only (Person = class 0)
 
 ```bash
-python run_inference.py \
+python infer_coreml.py \
   --input dataset/Company.coco/train \
   --model weights/dfine_x_obj2coco.mlpackage \
   --output_dir outputs/company_coco_dfine_x \

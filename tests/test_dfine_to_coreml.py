@@ -6,7 +6,7 @@ ct = pytest.importorskip("coremltools")
 torch = pytest.importorskip("torch")
 import torch.nn as nn
 
-import dfine_to_coreml as converter
+import export_dfine_coreml as converter
 
 
 class _DummyDetector(nn.Module):
