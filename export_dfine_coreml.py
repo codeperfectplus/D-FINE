@@ -257,7 +257,7 @@ def load_dfine(
 
     # Convert train-time modules to deploy/inference mode where available.
     if hasattr(model, "deploy"):
-        model = model.deploy()
+        model = model.deploy() # type: ignore
 
     # Replace built-in MHA to avoid known CoreML conversion failures in attention ops.
     replace_multihead_attention_for_export(model)
@@ -290,10 +290,10 @@ def trace_model(
 
     # Quick sanity check
     with torch.no_grad():
-        boxes, scores = traced(dummy_input)
+        boxes, scores = traced(dummy_input) # type: ignore
     print(f"  boxes  shape: {boxes.shape}")
     print(f"  scores shape: {scores.shape}")
-    return traced
+    return traced # type: ignore
 
 
 def export_model(
@@ -369,21 +369,21 @@ def convert_to_coreml(
     )
 
     # ── Metadata ───────────────────────────────────────────────────
-    mlmodel.short_description = "D-FINE real-time object detector (ICLR 2025)"
-    mlmodel.input_description["image"] = (
+    mlmodel.short_description = "D-FINE real-time object detector (ICLR 2025)" # type: ignore
+    mlmodel.input_description["image"] = ( # type: ignore
         f"RGB image, {input_size}×{input_size}, pixel values 0–255"
     )
-    mlmodel.output_description["boxes"] = (
+    mlmodel.output_description["boxes"] = ( # type: ignore
         "Bounding boxes [1, Q, 4] as (cx, cy, w, h) normalized 0–1"
     )
-    mlmodel.output_description["scores"] = (
+    mlmodel.output_description["scores"] = ( # type: ignore
         "Class probabilities [1, Q, C] after sigmoid"
     )
-    mlmodel.author = "CodePerfectplus | Deepak Raj"
-    mlmodel.version = "1.0"
+    mlmodel.author = "Scry AI" # type: ignore
+    mlmodel.version = "1.0" # type: ignore
 
 
-    mlmodel.save(output_path)
+    mlmodel.save(output_path) # type: ignore
     out_path = Path(output_path)
     size_mb = None
     if out_path.is_file():

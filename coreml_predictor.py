@@ -53,7 +53,7 @@ class DFineCoreMLPredictor:
         model_path: str,
         conf_threshold: float = 0.4,
         input_size: int = 640,
-        class_names: list = None,
+        class_names: list = None, # type: ignore
         compute_units=ct.ComputeUnit.ALL,
     ):
         self.conf_threshold = conf_threshold
@@ -190,7 +190,7 @@ class DFineCoreMLPredictor:
     def predict(
         self,
         image_source,
-        orig_size: tuple = None,
+        orig_size: tuple = None, # type: ignore
         return_raw_output: bool = False,
     ):
         """
@@ -258,7 +258,7 @@ class DFineCoreMLPredictor:
             raise TypeError(f"Unsupported image type: {type(source)}")
 
         orig_h, orig_w = img.size[1], img.size[0]
-        resized = img.resize((self.input_width, self.input_height), Image.BILINEAR)
+        resized = img.resize((self.input_width, self.input_height), Image.BILINEAR) # type: ignore
         return resized, (orig_h, orig_w)
 
     def _decode(self, boxes, scores, orig_h, orig_w):
@@ -339,12 +339,12 @@ class DFineCoreMLPredictor:
 
         for det in detections:
             x1, y1, x2, y2 = [int(v) for v in det["box_xyxy"]]
-            label = f"{det['class_name']} {det['score']:.2f}"
-            cv2.rectangle(img, (x1, y1), (x2, y2), (0, 200, 0), 2)
-            cv2.putText(img, label, (x1, max(y1 - 6, 12)),
+            label = f"{det['class_name']} {det['score']:.2f}" # type: ignore
+            cv2.rectangle(img, (x1, y1), (x2, y2), (0, 200, 0), 2) # type: ignore
+            cv2.putText(img, label, (x1, max(y1 - 6, 12)), # type: ignore
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 200, 0), 2)
 
-        cv2.imwrite(out_path, img)
+        cv2.imwrite(out_path, img) # type: ignore
         print(f"Saved visualization: {out_path}")
 
     # ── Video / webcam loop ───────────────────────────────────────

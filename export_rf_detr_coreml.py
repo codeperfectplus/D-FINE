@@ -153,10 +153,10 @@ class CoreMLFriendlyMSDeformAttn(nn.Module):
 
     def __init__(self, module: nn.Module):
         super().__init__()
-        self.d_model = int(module.d_model)
-        self.n_levels = int(module.n_levels)
-        self.n_heads = int(module.n_heads)
-        self.n_points = int(module.n_points)
+        self.d_model = int(module.d_model) # type: ignore
+        self.n_levels = int(module.n_levels) # type: ignore
+        self.n_heads = int(module.n_heads) # type: ignore
+        self.n_points = int(module.n_points) # type: ignore
         self.im2col_step = int(getattr(module, "im2col_step", 64))
 
         self.sampling_offsets = nn.Linear(
@@ -172,14 +172,14 @@ class CoreMLFriendlyMSDeformAttn(nn.Module):
         self.value_proj = nn.Linear(self.d_model, self.d_model, bias=True)
         self.output_proj = nn.Linear(self.d_model, self.d_model, bias=True)
 
-        self.sampling_offsets.weight.data.copy_(module.sampling_offsets.weight.detach())
-        self.sampling_offsets.bias.data.copy_(module.sampling_offsets.bias.detach())
-        self.attention_weights.weight.data.copy_(module.attention_weights.weight.detach())
-        self.attention_weights.bias.data.copy_(module.attention_weights.bias.detach())
-        self.value_proj.weight.data.copy_(module.value_proj.weight.detach())
-        self.value_proj.bias.data.copy_(module.value_proj.bias.detach())
-        self.output_proj.weight.data.copy_(module.output_proj.weight.detach())
-        self.output_proj.bias.data.copy_(module.output_proj.bias.detach())
+        self.sampling_offsets.weight.data.copy_(module.sampling_offsets.weight.detach()) # type: ignore
+        self.sampling_offsets.bias.data.copy_(module.sampling_offsets.bias.detach()) # type: ignore
+        self.attention_weights.weight.data.copy_(module.attention_weights.weight.detach()) # type: ignore
+        self.attention_weights.bias.data.copy_(module.attention_weights.bias.detach()) # type: ignore
+        self.value_proj.weight.data.copy_(module.value_proj.weight.detach()) # type: ignore
+        self.value_proj.bias.data.copy_(module.value_proj.bias.detach()) # type: ignore
+        self.output_proj.weight.data.copy_(module.output_proj.weight.detach()) # type: ignore
+        self.output_proj.bias.data.copy_(module.output_proj.bias.detach()) # type: ignore
 
     @property
     def _d_per_head(self) -> int:
@@ -302,7 +302,7 @@ class CoreMLFriendlyMSDeformAttn(nn.Module):
             weighted_l = (sampled_l * attn_l).sum(-1)
             output_acc = weighted_l if output_acc is None else output_acc + weighted_l
 
-        output = output_acc.view(n_batch, self.n_heads * self._d_per_head, len_q)
+        output = output_acc.view(n_batch, self.n_heads * self._d_per_head, len_q) # type: ignore
         output = output.transpose(1, 2).contiguous()
         output = self.output_proj(output)
         return output
@@ -864,7 +864,7 @@ def patch_coremltools_tensor_inplace_copy():
 
         updates_shape = getattr(updates, "shape", None)
         if updates_shape is not None and len(updates_shape) == 1 and updates_shape[0] == 1:
-            updates = mb.squeeze(x=updates, axes=[0])
+            updates = mb.squeeze(x=updates, axes=[0]) # type: ignore
 
         begin, end, stride, begin_mask, end_mask, squeeze_mask = ct_ops._get_slice_params(
             context,
@@ -925,7 +925,7 @@ def patch_coremltools_meshgrid():
 
         tensor_inputs = inputs[0]
         indexing = inputs[1].val if nargs > 1 else "ij"
-        indexing = ct_ops._get_kwinputs(context, node, "indexing", default=[indexing])[0]
+        indexing = ct_ops._get_kwinputs(context, node, "indexing", default=[indexing])[0] # type: ignore
 
         if not isinstance(tensor_inputs, (list, tuple)) or len(tensor_inputs) < 2:
             raise ValueError("Requires >= 2 tensor inputs.")
@@ -936,7 +936,7 @@ def patch_coremltools_meshgrid():
         for idx, tensor_input in enumerate(tensor_inputs):
             rank = getattr(tensor_input, "rank", None)
             if rank is not None and rank > 1:
-                tensor_input = mb.reshape(
+                tensor_input = mb.reshape( # type: ignore
                     x=tensor_input,
                     shape=(-1,),
                     name=f"{node.name}_flatten_{idx}",
@@ -954,7 +954,7 @@ def patch_coremltools_meshgrid():
         for i in range(size):
             view_shape = [1] * size
             view_shape[i] = -1
-            view = mb.reshape(
+            view = mb.reshape( # type: ignore
                 x=normalized_inputs[i],
                 shape=tuple(view_shape),
                 name=f"{node.name}_view_{i}",
@@ -963,14 +963,13 @@ def patch_coremltools_meshgrid():
             reps = result_shape.copy()
             reps[i] = 1
             if any(isinstance(rep, ct_ops.Var) for rep in reps):
-                reps = mb.concat(values=reps, axis=0)
+                reps = mb.concat(values=reps, axis=0) # type: ignore
 
-            res = mb.tile(x=view, reps=reps, name=f"{node.name}_expand_{i}")
+            res = mb.tile(x=view, reps=reps, name=f"{node.name}_expand_{i}") # type: ignore
 
             if indexing == "xy":
                 perm = [1, 0] + list(range(2, size))
-                res = mb.transpose(x=res, perm=perm, name=f"{node.name}_transpose_{i}")
-
+                res = mb.transpose(x=res, perm=perm, name=f"{node.name}_transpose_{i}") # type: ignore
             grids.append(res)
 
         context.add(tuple(grids), node.name)
@@ -1016,7 +1015,7 @@ def patch_coremltools_split_with_sizes():
         split_sizes = inputs[1]
         dim = inputs[2] if nargs > 2 else 0
 
-        dim = ct_ops._get_kwinputs(context, node, "dim", default=[dim])[0]
+        dim = ct_ops._get_kwinputs(context, node, "dim", default=[dim])[0] # type: ignore
         if isinstance(dim, ct_ops.Var):
             dim = dim.val
 
@@ -1026,7 +1025,7 @@ def patch_coremltools_split_with_sizes():
                 if isinstance(item, ct_ops.Var):
                     if item.val is not None:
                         size_tensors.append(
-                            mb.const(
+                            mb.const( # type: ignore
                                 val=[int(item.val)],
                                 name=f"{node.name}_split_size_const_{idx}",
                             )
@@ -1035,13 +1034,13 @@ def patch_coremltools_split_with_sizes():
                         rank = getattr(item, "rank", None)
                         tensor_item = item
                         if rank == 0:
-                            tensor_item = mb.expand_dims(
+                            tensor_item = mb.expand_dims( # type: ignore
                                 x=item,
                                 axes=[0],
                                 name=f"{node.name}_split_size_expand_{idx}",
                             )
                         elif rank is not None and rank > 1:
-                            tensor_item = mb.reshape(
+                            tensor_item = mb.reshape( # type: ignore
                                 x=item,
                                 shape=(-1,),
                                 name=f"{node.name}_split_size_flatten_{idx}",
@@ -1049,7 +1048,7 @@ def patch_coremltools_split_with_sizes():
                         size_tensors.append(tensor_item)
                 else:
                     size_tensors.append(
-                        mb.const(
+                        mb.const( # type: ignore
                             val=[int(item)],
                             name=f"{node.name}_split_size_const_{idx}",
                         )
@@ -1058,7 +1057,7 @@ def patch_coremltools_split_with_sizes():
             if len(size_tensors) == 1:
                 split_sizes = size_tensors[0]
             else:
-                split_sizes = mb.concat(
+                split_sizes = mb.concat( # type: ignore
                     values=size_tensors,
                     axis=0,
                     name=f"{node.name}_split_sizes_concat",
@@ -1069,22 +1068,22 @@ def patch_coremltools_split_with_sizes():
             and getattr(split_sizes, "rank", None) == 0
             and not isinstance(split_sizes.val, np.ndarray)
         ):
-            shape = mb.shape(x=x)
+            shape = mb.shape(x=x) # type: ignore
             dim_size = ct_ops._list_select(shape, dim)
-            num_whole_splits = mb.floor_div(x=dim_size, y=split_sizes)
-            remainder = mb.mod(x=dim_size, y=split_sizes)
+            num_whole_splits = mb.floor_div(x=dim_size, y=split_sizes) # type: ignore
+            remainder = mb.mod(x=dim_size, y=split_sizes) # type: ignore
 
-            tmp = mb.const(val=[1])
-            whole_sizes = mb.mul(x=tmp, y=split_sizes)
-            reps = mb.mul(x=tmp, y=num_whole_splits)
-            whole_sizes = mb.tile(x=whole_sizes, reps=reps)
+            tmp = mb.const(val=[1]) # type: ignore
+            whole_sizes = mb.mul(x=tmp, y=split_sizes) # type: ignore
+            reps = mb.mul(x=tmp, y=num_whole_splits) # type: ignore
+            whole_sizes = mb.tile(x=whole_sizes, reps=reps) # type: ignore
             if remainder.val == 0:
                 split_sizes = whole_sizes
             else:
-                partial_size = mb.mul(x=tmp, y=remainder)
-                split_sizes = mb.concat(values=[whole_sizes, partial_size], axis=0)
+                partial_size = mb.mul(x=tmp, y=remainder) # type: ignore
+                split_sizes = mb.concat(values=[whole_sizes, partial_size], axis=0) # type: ignore
 
-        res = mb.split(x=x, split_sizes=split_sizes, axis=dim, name=node.name)
+        res = mb.split(x=x, split_sizes=split_sizes, axis=dim, name=node.name) # type: ignore
         context.add(res, torch_name=node.name)
 
     ct_ops.split = patched_split
