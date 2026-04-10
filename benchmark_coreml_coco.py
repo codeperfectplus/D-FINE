@@ -171,7 +171,16 @@ def choose_gt_category_ids(categories: List[Dict]) -> Set[int]:
     return {int(cat["id"]) for cat in categories}
 
 
-def parse_class_ids(text: str) -> Set[int]:
+def parse_class_ids(text: str, model_path: Path) -> Set[int]:
+    raw = text.strip().lower()
+    if raw == "auto":
+        model_name = model_path.name.lower()
+        # RF-DETR exports include a background class at index 0, so person is 1.
+        if "rf-detr" in model_name or "rfdetr" in model_name:
+            return {1}
+        # D-FINE exports in this workspace use person at class id 0.
+        return {0}
+
     return {int(x.strip()) for x in text.split(",") if x.strip()}
 
 
@@ -202,8 +211,11 @@ def parse_args():
     )
     parser.add_argument(
         "--pred_class_ids",
-        default="0",
-        help="Comma-separated predicted class IDs treated as Human (default: 0)",
+        default="auto",
+        help=(
+            "Comma-separated predicted class IDs treated as Human, or 'auto'. "
+            "Auto picks 1 for RF-DETR models and 0 for D-FINE models."
+        ),
     )
     parser.add_argument(
         "--output_json",
@@ -242,7 +254,7 @@ def main():
         for c in categories
         if int(c.get("id", -1)) in gt_category_ids
     ]
-    pred_class_ids = parse_class_ids(args.pred_class_ids)
+    pred_class_ids = parse_class_ids(args.pred_class_ids, model_path)
 
     print(f"Images in annotations: {len(coco.get('images', []))}")
     print(f"GT categories merged as Human: {sorted(gt_category_ids)}")

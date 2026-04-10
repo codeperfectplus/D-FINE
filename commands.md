@@ -14,6 +14,32 @@ python export_dfine_coreml.py \
   --benchmark_compute_units CPU_AND_GPU,ALL,CPU_ONLY
 ```
 
+
+
+### RF-DETR conversion (no YAML required)
+
+```bash
+# If rfdetr is not installed in your active env:
+# pip install rfdetr
+
+python export_rf_detr_coreml.py \
+  --checkpoint weights/rf-detr-xxlarge.pth \
+  --model_class RFDETR2XLarge \
+  --input_size 512 \
+  --compute_precision float16 \
+  --compute_units cpu_and_gpu \
+  --output weights/rf-detr-xxlarge.mlpackage
+```
+
+```bash
+# If constructor needs custom args, pass JSON
+python export_rf_detr_coreml.py \
+  --checkpoint weights/rf-detr-xxlarge.pth \
+  --model_class RFDETR2XLarge \
+  --constructor_kwargs '{"num_classes": 91}' \
+  --output weights/rf-detr-xxlarge.mlpackage
+```
+
 ---
 
 ## 2) Run Inference
@@ -72,6 +98,12 @@ python benchmark_coreml_coco.py \
   --output_json outputs/company_coco_coreml_report.json \
   --output_csv outputs/company_coco_coreml_metrics.csv
 ```
+
+```bash
+python benchmark_coreml_coco.py --model weights/rf-detr-xxlarge.mlpackage --annotations dataset/Company.coco/train/_annotations.coco.json --images_dir dataset/Company.coco/train --compute_units cpu_and_ne --output_json outputs/company_coco_coreml_report_auto.json --output_csv outputs/company_coco_coreml_metrics_auto.csv
+```
+
+
 
 ---
 
