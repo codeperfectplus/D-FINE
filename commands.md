@@ -97,8 +97,8 @@ python run_parallel_rtsp_infer.py \
 # Infer every 2nd frame
 python run_parallel_rtsp_infer.py \
   --input_source /Users/alpha/codespace/experiments/human_detection/input/people-detection.mp4 \
-  --num_streams 4 \
-  --input_size 512 \
+  --num_streams 8 \
+  --input_size 528 \
   --frame_stride 2 \
   --stats_interval 1.0
 

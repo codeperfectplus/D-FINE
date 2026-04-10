@@ -253,7 +253,7 @@ def _print_fps_snapshot(stats_by_stream, stats_lock, expected_streams: int):
 
     if not snapshot:
         print("[FPS] waiting for stream metrics...")
-        return
+        return None
 
     stream_names = sorted(snapshot.keys())
     per_stream_chunks = []
@@ -290,6 +290,166 @@ def _print_fps_snapshot(stats_by_stream, stats_lock, expected_streams: int):
         f"sum_model={total_model_infer_fps:.2f} avg_model={avg_model_infer_fps:.2f}"
     )
 
+    return {
+        "timestamp": time.perf_counter(),
+        "active_streams": active_streams,
+        "sum_infer_fps": total_infer_fps,
+        "sum_model_infer_fps": total_model_infer_fps,
+    }
+
+
+def _summarize_parallel_window_fps(fps_snapshots):
+    if not fps_snapshots:
+        return {
+            "peak_sum_infer_fps": 0.0,
+            "peak_sum_model_fps": 0.0,
+            "avg_sum_infer_fps": 0.0,
+            "avg_sum_model_fps": 0.0,
+            "active_window_s": 0.0,
+        }
+
+    peak_sum_infer_fps = max(item["sum_infer_fps"] for item in fps_snapshots)
+    peak_sum_model_fps = max(item["sum_model_infer_fps"] for item in fps_snapshots)
+
+    weighted_sum_infer = 0.0
+    weighted_sum_model = 0.0
+    weighted_duration_s = 0.0
+
+    for previous, current in zip(fps_snapshots, fps_snapshots[1:]):
+        delta_s = max(current["timestamp"] - previous["timestamp"], 0.0)
+        if delta_s <= 0:
+            continue
+        weighted_sum_infer += previous["sum_infer_fps"] * delta_s
+        weighted_sum_model += previous["sum_model_infer_fps"] * delta_s
+        weighted_duration_s += delta_s
+
+    if weighted_duration_s > 0:
+        avg_sum_infer_fps = weighted_sum_infer / weighted_duration_s
+        avg_sum_model_fps = weighted_sum_model / weighted_duration_s
+    else:
+        avg_sum_infer_fps = sum(item["sum_infer_fps"] for item in fps_snapshots) / len(
+            fps_snapshots
+        )
+        avg_sum_model_fps = sum(
+            item["sum_model_infer_fps"] for item in fps_snapshots
+        ) / len(fps_snapshots)
+
+    return {
+        "peak_sum_infer_fps": peak_sum_infer_fps,
+        "peak_sum_model_fps": peak_sum_model_fps,
+        "avg_sum_infer_fps": avg_sum_infer_fps,
+        "avg_sum_model_fps": avg_sum_model_fps,
+        "active_window_s": weighted_duration_s,
+    }
+
+
+def _print_final_aggregate_inference_summary(
+    processes,
+    run_wall_time_s: float,
+    run_start_epoch_s: float,
+    fps_snapshots,
+):
+    total_frames_read = 0
+    total_frames_inferred = 0
+    total_frames_skipped = 0
+    total_video_elapsed_s = 0.0
+    total_model_infer_elapsed_s = 0.0
+    parsed_reports = 0
+    missing_reports = []
+
+    for _, stream_name, _, stream_output_dir in processes:
+        all_report_paths = sorted(
+            stream_output_dir.glob("*_coreml_report*.json"),
+            key=lambda path: path.stat().st_mtime,
+        )
+        report_paths = [
+            path for path in all_report_paths if path.stat().st_mtime >= run_start_epoch_s - 1.0
+        ]
+
+        if not report_paths:
+            missing_reports.append(stream_name)
+            continue
+
+        for report_path in report_paths:
+            try:
+                report = json.loads(report_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                print(f"[{stream_name}] failed to read report {report_path}: {exc}")
+                continue
+
+            parsed_reports += 1
+
+            frames_read = int(report.get("frames_read", 0))
+            frames_inferred = int(report.get("frames_inferred", 0))
+            frames_skipped = int(
+                report.get("frames_skipped", max(frames_read - frames_inferred, 0))
+            )
+            effective_infer_fps = float(report.get("effective_inference_fps", 0.0))
+            avg_latency_ms = float(report.get("average_latency_ms", 0.0))
+
+            total_frames_read += frames_read
+            total_frames_inferred += frames_inferred
+            total_frames_skipped += frames_skipped
+
+            if effective_infer_fps > 0:
+                total_video_elapsed_s += frames_inferred / effective_infer_fps
+
+            if avg_latency_ms > 0:
+                total_model_infer_elapsed_s += (frames_inferred * avg_latency_ms) / 1000.0
+
+    if parsed_reports == 0:
+        print("\nAggregate inference summary: unavailable (no JSON reports found).")
+        return
+
+    frame_weighted_effective_fps = (
+        total_frames_inferred / total_video_elapsed_s if total_video_elapsed_s > 0 else 0.0
+    )
+    frame_weighted_model_fps = (
+        total_frames_inferred / total_model_infer_elapsed_s
+        if total_model_infer_elapsed_s > 0
+        else 0.0
+    )
+    wall_clock_throughput_fps = (
+        total_frames_inferred / run_wall_time_s if run_wall_time_s > 0 else 0.0
+    )
+    window_summary = _summarize_parallel_window_fps(fps_snapshots)
+
+    print("\nAggregate inference summary")
+    print(f"Reports parsed: {parsed_reports}")
+    print(f"Frames read (all streams): {total_frames_read}")
+    print(f"Frames inferred (all streams): {total_frames_inferred}")
+    print(f"Frames skipped (all streams): {total_frames_skipped}")
+    print(
+        "Average effective inference FPS (frame-weighted): "
+        f"{frame_weighted_effective_fps:.2f}"
+    )
+    print(
+        "Average model-only inference FPS (latency-weighted): "
+        f"{frame_weighted_model_fps:.2f}"
+    )
+    print(
+        "Overall throughput FPS (wall-clock, stagger-aware): "
+        f"{wall_clock_throughput_fps:.2f} over {run_wall_time_s:.2f}s"
+    )
+    print(
+        "Peak parallel inferred FPS (window sum): "
+        f"{window_summary['peak_sum_infer_fps']:.2f}"
+    )
+    print(
+        "Average parallel inferred FPS (active window): "
+        f"{window_summary['avg_sum_infer_fps']:.2f}"
+    )
+    print(
+        "Peak parallel model FPS (window sum): "
+        f"{window_summary['peak_sum_model_fps']:.2f}"
+    )
+    print(
+        "Average parallel model FPS (active window): "
+        f"{window_summary['avg_sum_model_fps']:.2f}"
+    )
+    if missing_reports:
+        print(f"Missing stream reports: {', '.join(sorted(missing_reports))}")
+
 
 def main():
     args = parse_args()
@@ -297,12 +457,12 @@ def main():
     if args.num_streams < 1:
         raise ValueError("--num_streams must be >= 1")
 
-    input_sources_per_stream = resolve_input_sources(args)
-    compute_units_per_stream = resolve_compute_units_per_stream(args)
-
     infer_script = Path(args.infer_script)
     model_path = Path(args.model)
     output_base = Path(args.output_dir)
+
+    input_sources_per_stream = resolve_input_sources(args)
+    compute_units_per_stream = resolve_compute_units_per_stream(args)
 
     if not infer_script.exists():
         raise FileNotFoundError(f"infer script not found: {infer_script}")
@@ -315,6 +475,7 @@ def main():
     stats_lock = threading.Lock()
     processes = []
     reader_threads = []
+    fps_snapshots = []
 
     print(f"Launching {args.num_streams} parallel stream(s)")
     print(f"Input source[1]: {input_sources_per_stream[0]}")
@@ -326,6 +487,9 @@ def main():
     print("Dedicated model instances: enabled (one per stream process)")
     print(f"Max frames mode: {'ON' if args.max_frames_mode else 'OFF'}")
     print(f"Frame stride: {args.frame_stride}")
+
+    parallel_run_start = time.perf_counter()
+    parallel_run_start_epoch = time.time()
 
     for stream_idx in range(1, args.num_streams + 1):
         input_source = input_sources_per_stream[stream_idx - 1]
@@ -372,7 +536,11 @@ def main():
         while True:
             now = time.perf_counter()
             if now >= next_fps_log_time:
-                _print_fps_snapshot(stats_by_stream, stats_lock, args.num_streams)
+                fps_snapshot = _print_fps_snapshot(
+                    stats_by_stream, stats_lock, args.num_streams
+                )
+                if fps_snapshot is not None:
+                    fps_snapshots.append(fps_snapshot)
                 next_fps_log_time = now + max(args.stats_interval, 0.1)
 
             if all(proc.poll() is not None for _, _, proc, _ in processes):
@@ -402,7 +570,16 @@ def main():
     for reader in reader_threads:
         reader.join(timeout=1)
 
-    _print_fps_snapshot(stats_by_stream, stats_lock, args.num_streams)
+    final_snapshot = _print_fps_snapshot(stats_by_stream, stats_lock, args.num_streams)
+    if final_snapshot is not None:
+        fps_snapshots.append(final_snapshot)
+    run_wall_time_s = max(time.perf_counter() - parallel_run_start, 1e-9)
+    _print_final_aggregate_inference_summary(
+        processes,
+        run_wall_time_s,
+        parallel_run_start_epoch,
+        fps_snapshots,
+    )
 
     failed = sum(1 for code in exit_codes if code != 0)
     succeeded = len(exit_codes) - failed
