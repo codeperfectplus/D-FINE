@@ -1,6 +1,7 @@
 import argparse
 import json
 import statistics
+import time
 from pathlib import Path
 from typing import List, Optional, Set, Tuple
 
@@ -18,6 +19,27 @@ COMPUTE_UNIT_MAP = {
     "cpu_and_ne": ct.ComputeUnit.CPU_AND_NE,
     "cpu_only": ct.ComputeUnit.CPU_ONLY,
 }
+
+
+def is_stream_uri(value: str) -> bool:
+    lowered = value.lower()
+    return lowered.startswith(("rtsp://", "rtsps://", "http://", "https://"))
+
+
+def sanitize_source_name(value: str) -> str:
+    sanitized = []
+    for ch in value.lower():
+        if ch.isalnum():
+            sanitized.append(ch)
+        elif ch in {"-", "_"}:
+            sanitized.append(ch)
+        else:
+            sanitized.append("_")
+
+    collapsed = "".join(sanitized).strip("_")
+    while "__" in collapsed:
+        collapsed = collapsed.replace("__", "_")
+    return collapsed[:80] or "stream"
 
 
 def parse_class_ids_arg(classes_arg: str) -> Optional[Set[int]]:
@@ -183,14 +205,31 @@ def get_output_paths(
     return ensure_unique_output_pair(output_media, output_json)
 
 
+def get_stream_output_paths(stream_source: str, output_dir: Path) -> Tuple[Path, Path]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    stem = sanitize_source_name(stream_source)
+    output_media = output_dir / f"{stem}_coreml_output.mp4"
+    output_json = output_dir / f"{stem}_coreml_report.json"
+    return ensure_unique_output_pair(output_media, output_json)
+
+
 def run_video_inference(
     predictor: DFineCoreMLPredictor,
     model_path: Path,
-    video_path: Path,
+    video_path: str | Path,
     output_video: Path,
     output_json: Path,
     class_ids: Optional[Set[int]] = None,
+    stream_label: Optional[str] = None,
+    fps_log_interval: float = 2.0,
+    model_instance: Optional[str] = None,
+    render_output: bool = True,
+    save_output_video: bool = True,
+    frame_stride: int = 1,
 ):
+    if frame_stride < 1:
+        raise ValueError("frame_stride must be >= 1")
+
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise RuntimeError(f"Failed to open video: {video_path}")
@@ -201,71 +240,152 @@ def run_video_inference(
 
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(str(output_video), fourcc, src_fps, (width, height))
-    if not writer.isOpened():
-        cap.release()
-        raise RuntimeError(f"Failed to create output video: {output_video}")
+    writer = None
+    if save_output_video:
+        fourcc = cv2.VideoWriter.fourcc(*"mp4v")
+        writer = cv2.VideoWriter(str(output_video), fourcc, src_fps, (width, height))
+        if not writer.isOpened():
+            cap.release()
+            raise RuntimeError(f"Failed to create output video: {output_video}")
 
     latencies = []
-    frame_index = 0
+    frame_read_count = 0
+    frame_inferred_count = 0
+    stream_name = stream_label or str(video_path)
+    model_instance_name = model_instance or "default"
+    total_start = time.perf_counter()
+    log_window_start = time.perf_counter()
+    window_read_frames = 0
+    window_infer_frames = 0
+    window_infer_ms = 0.0
 
     print(f"Running inference on: {video_path}")
+    print(f"Model instance: {model_instance_name}")
+    print(f"Frame stride: {frame_stride}")
     while True:
         ok, frame = cap.read()
         if not ok:
             break
 
-        timestamp_s = frame_index / src_fps
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        detections, latency_ms = predictor.predict(rgb, orig_size=(height, width))
-        detections = filter_detections_by_class(detections, class_ids)
-        infer_fps = 1000.0 / latency_ms if latency_ms > 0 else 0.0
+        frame_read_count += 1
+        window_read_frames += 1
+        timestamp_s = (frame_read_count - 1) / src_fps
 
-        latencies.append(latency_ms)
-        draw_detections(frame, detections)
+        should_infer = ((frame_read_count - 1) % frame_stride) == 0
+        detections = []
+        latency_ms = 0.0
+        infer_fps = 0.0
 
-        cv2.putText(
-            frame,
-            f"t={timestamp_s:.2f}s",
-            (10, 24),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (0, 0, 255),
-            2,
-        )
-        cv2.putText(
-            frame,
-            f"lat={latency_ms:.1f}ms fps={infer_fps:.1f}",
-            (10, 50),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (0, 0, 255),
-            2,
-        )
+        if should_infer:
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            detections, latency_ms = predictor.predict(rgb, orig_size=(height, width))
+            detections = filter_detections_by_class(detections, class_ids)
+            infer_fps = 1000.0 / latency_ms if latency_ms > 0 else 0.0
 
-        writer.write(frame)
+            latencies.append(latency_ms)
+            frame_inferred_count += 1
+            window_infer_frames += 1
+            window_infer_ms += latency_ms
 
-        frame_index += 1
+        if render_output:
+            if should_infer:
+                draw_detections(frame, detections)
+
+            cv2.putText(
+                frame,
+                f"t={timestamp_s:.2f}s",
+                (10, 24),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 0, 255),
+                2,
+            )
+            if should_infer:
+                cv2.putText(
+                    frame,
+                    f"lat={latency_ms:.1f}ms fps={infer_fps:.1f}",
+                    (10, 50),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (0, 0, 255),
+                    2,
+                )
+            elif frame_stride > 1:
+                cv2.putText(
+                    frame,
+                    f"skipped (stride={frame_stride})",
+                    (10, 50),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (0, 0, 255),
+                    2,
+                )
+
+        if writer is not None:
+            writer.write(frame)
+
+        if fps_log_interval > 0:
+            elapsed_s = time.perf_counter() - log_window_start
+            if elapsed_s >= fps_log_interval and window_read_frames > 0:
+                camera_fps = window_read_frames / elapsed_s
+                effective_infer_fps = window_infer_frames / elapsed_s
+                model_infer_fps = (
+                    (window_infer_frames * 1000.0) / window_infer_ms
+                    if window_infer_ms > 0
+                    else 0.0
+                )
+                print(
+                    "FPS_LOG "
+                    + json.dumps(
+                        {
+                            "stream": stream_name,
+                            "model_instance": model_instance_name,
+                            "camera_fps": round(camera_fps, 3),
+                            "infer_fps": round(effective_infer_fps, 3),
+                            "model_infer_fps": round(model_infer_fps, 3),
+                            "frames_total": frame_read_count,
+                            "frames_inferred": frame_inferred_count,
+                            "source_fps_nominal": round(src_fps, 3),
+                            "frame_stride": frame_stride,
+                        }
+                    ),
+                    flush=True,
+                )
+                log_window_start = time.perf_counter()
+                window_read_frames = 0
+                window_infer_frames = 0
+                window_infer_ms = 0.0
 
     cap.release()
-    writer.release()
+    if writer is not None:
+        writer.release()
 
+    total_elapsed_s = max(time.perf_counter() - total_start, 1e-9)
     avg_latency = statistics.mean(latencies) if latencies else 0.0
     med_latency = statistics.median(latencies) if latencies else 0.0
-    avg_infer_fps = (1000.0 / avg_latency) if avg_latency > 0 else 0.0
+    avg_infer_fps_model = (1000.0 / avg_latency) if avg_latency > 0 else 0.0
+    effective_camera_fps = frame_read_count / total_elapsed_s
+    effective_infer_fps = frame_inferred_count / total_elapsed_s
 
     report = {
         "input_type": "video",
         "input_path": str(video_path),
         "video_path": str(video_path),
         "model_path": str(model_path),
+        "model_instance": model_instance_name,
+        "frame_stride": frame_stride,
         "class_filter_ids": sorted(class_ids) if class_ids is not None else "all",
-        "frames_processed": frame_index,
+        "frames_read": frame_read_count,
+        "frames_inferred": frame_inferred_count,
+        "frames_skipped": frame_read_count - frame_inferred_count,
+        "frames_processed": frame_inferred_count,
         "source_video_fps": round(src_fps, 3),
+        "effective_camera_fps": round(effective_camera_fps, 3),
+        "effective_inference_fps": round(effective_infer_fps, 3),
+        "output_video_saved": bool(save_output_video),
         "average_latency_ms": round(avg_latency, 3),
         "median_latency_ms": round(med_latency, 3),
-        "average_inference_fps": round(avg_infer_fps, 3),
+        "average_inference_fps": round(avg_infer_fps_model, 3),
     }
 
     output_json.write_text(json.dumps(report, indent=2), encoding="utf-8")
@@ -368,26 +488,74 @@ def parse_args():
         default="all",
         help="Class IDs to keep. Use 'all' (default), '0', '0,1', or '[0,1]'.",
     )
+    parser.add_argument(
+        "--stream_label",
+        default="",
+        help="Optional stream label used in periodic FPS logs.",
+    )
+    parser.add_argument(
+        "--fps_log_interval",
+        type=float,
+        default=2.0,
+        help="Seconds between periodic FPS log lines for video/stream inputs.",
+    )
+    parser.add_argument(
+        "--model_instance",
+        default="",
+        help="Optional label to identify the model instance in logs/reports.",
+    )
+    parser.add_argument(
+        "--no_render",
+        action="store_true",
+        help="Disable drawing overlays for higher throughput.",
+    )
+    parser.add_argument(
+        "--no_save_video",
+        action="store_true",
+        help="Skip writing output video for higher throughput (JSON report is still saved).",
+    )
+    parser.add_argument(
+        "--frame_stride",
+        type=int,
+        default=1,
+        help="Run inference every Nth frame (1 = infer every frame, 2 = every other frame).",
+    )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    input_path = Path(args.input or args.video)
+    input_value = args.input or args.video
+    assert input_value is not None
+    use_stream_input = is_stream_uri(input_value)
+    input_path = None if use_stream_input else Path(input_value)
     model_path = Path(args.model)
     output_dir = Path(args.output_dir)
 
-    if not input_path.exists():
-        raise FileNotFoundError(f"Input path not found: {input_path}")
+    if not use_stream_input:
+        assert input_path is not None
+        if not input_path.exists():
+            raise FileNotFoundError(f"Input path not found: {input_path}")
     if not model_path.exists():
         raise FileNotFoundError(f"CoreML model not found: {model_path}")
 
     exclude_dir = None
-    if input_path.is_dir() and is_relative_to(output_dir.resolve(), input_path.resolve()):
+    if (
+        input_path is not None
+        and input_path.is_dir()
+        and is_relative_to(output_dir.resolve(), input_path.resolve())
+    ):
         exclude_dir = output_dir.resolve()
 
-    input_files = collect_media_inputs(input_path, exclude_dir=exclude_dir)
-    print(f"Found {len(input_files)} supported input file(s).")
+    if use_stream_input:
+        print("Found 1 stream input.")
+        stream_source = input_value
+        input_files = []
+    else:
+        assert input_path is not None
+        input_files = collect_media_inputs(input_path, exclude_dir=exclude_dir)
+        print(f"Found {len(input_files)} supported input file(s).")
+        stream_source = ""
 
     compute_units, compute_units_name = resolve_compute_units(
         args.compute_units,
@@ -408,45 +576,80 @@ def main():
         compute_units=compute_units,
     )
 
-    input_root = input_path if input_path.is_dir() else None
+    input_root = input_path if (input_path is not None and input_path.is_dir()) else None
     reports = []
 
-    for index, media_path in enumerate(input_files, start=1):
-        media_kind = get_media_kind(media_path)
-        output_media, output_json = get_output_paths(
-            media_path,
-            output_dir,
-            input_root=input_root,
+    if use_stream_input:
+        output_media, output_json = get_stream_output_paths(stream_source, output_dir)
+        print(f"[1/1] Processing video stream: {stream_source}")
+        report = run_video_inference(
+            predictor=predictor,
+            model_path=model_path,
+            video_path=stream_source,
+            output_video=output_media,
+            output_json=output_json,
+            class_ids=class_ids,
+            stream_label=args.stream_label or None,
+            fps_log_interval=args.fps_log_interval,
+            model_instance=args.model_instance or None,
+            render_output=not args.no_render,
+            save_output_video=not args.no_save_video,
+            frame_stride=args.frame_stride,
         )
-        print(f"[{index}/{len(input_files)}] Processing {media_kind}: {media_path}")
-
-        if media_kind == "video":
-            report = run_video_inference(
-                predictor=predictor,
-                model_path=model_path,
-                video_path=media_path,
-                output_video=output_media,
-                output_json=output_json,
-                class_ids=class_ids,
-            )
-        elif media_kind == "image":
-            report = run_image_inference(
-                predictor=predictor,
-                model_path=model_path,
-                image_path=media_path,
-                output_image=output_media,
-                output_json=output_json,
-                class_ids=class_ids,
-            )
-        else:
-            continue
-
         report["output_path"] = str(output_media)
         report["report_path"] = str(output_json)
         reports.append(report)
-
-        print(f"Output saved : {output_media}")
+        if not args.no_save_video:
+            print(f"Output saved : {output_media}")
+        else:
+            print("Output saved : disabled (--no_save_video)")
         print(f"JSON report  : {output_json}")
+    else:
+        for index, media_path in enumerate(input_files, start=1):
+            media_kind = get_media_kind(media_path)
+            output_media, output_json = get_output_paths(
+                media_path,
+                output_dir,
+                input_root=input_root,
+            )
+            print(f"[{index}/{len(input_files)}] Processing {media_kind}: {media_path}")
+
+            if media_kind == "video":
+                report = run_video_inference(
+                    predictor=predictor,
+                    model_path=model_path,
+                    video_path=media_path,
+                    output_video=output_media,
+                    output_json=output_json,
+                    class_ids=class_ids,
+                    stream_label=args.stream_label or None,
+                    fps_log_interval=args.fps_log_interval,
+                    model_instance=args.model_instance or None,
+                    render_output=not args.no_render,
+                    save_output_video=not args.no_save_video,
+                    frame_stride=args.frame_stride,
+                )
+            elif media_kind == "image":
+                report = run_image_inference(
+                    predictor=predictor,
+                    model_path=model_path,
+                    image_path=media_path,
+                    output_image=output_media,
+                    output_json=output_json,
+                    class_ids=class_ids,
+                )
+            else:
+                continue
+
+            report["output_path"] = str(output_media)
+            report["report_path"] = str(output_json)
+            reports.append(report)
+
+            if not args.no_save_video:
+                print(f"Output saved : {output_media}")
+            else:
+                print("Output saved : disabled (--no_save_video)")
+            print(f"JSON report  : {output_json}")
 
     if not reports:
         raise RuntimeError("No inputs were processed.")
